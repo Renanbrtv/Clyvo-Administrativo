@@ -1,0 +1,1507 @@
+diff --git a/Dockerfile b/Dockerfile
+index 4dfcae7..11de5cd 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -24,6 +24,8 @@ RUN npm ci
+ COPY backend/tsconfig.json ./
+ COPY backend/src ./src
+ RUN npm run build
++COPY admin /admin
++RUN cd /admin && node /app/node_modules/typescript/bin/tsc && node build.mjs
+ 
+ # Descarta as dependencias de desenvolvimento.
+ RUN npm prune --omit=dev
+@@ -32,10 +34,12 @@ RUN npm prune --omit=dev
+ FROM node:22-alpine AS runtime
+ 
+ ENV NODE_ENV=production
++ENV ADMIN_STATIC_DIR=/app/admin
+ WORKDIR /app
+ 
+ COPY --from=build --chown=node:node /app/node_modules ./node_modules
+ COPY --from=build --chown=node:node /app/dist ./dist
++COPY --from=build --chown=node:node /admin/dist ./admin
+ COPY --chown=node:node backend/package.json ./
+ # O script de migration le daqui.
+ COPY --chown=node:node database ./database
+diff --git a/admin/README.md b/admin/README.md
+new file mode 100644
+index 0000000..0eb000d
+--- /dev/null
++++ b/admin/README.md
+@@ -0,0 +1,82 @@
++# Clyvo Admin
++
++Interface web independente, servida em `/admin/` pelo backend existente. Usa os mesmos usuários e dados do marketplace, com autorização administrativa separada. Não há senha fixa, cadastro público de administradores ou dados fictícios na interface.
++
++## O que foi implementado
++
++- Dashboard com contagens reais e crescimento mensal de cadastros.
++- Pesquisa global limitada às permissões do operador, filtros e paginação.
++- Consulta de usuários, suspensão e reativação com justificativa e revogação de sessões.
++- Moderação de publicações e perfis: aprovação, reprovação, solicitação de correções e suspensão; decisões exigem justificativa e conferem a revisão do conteúdo para evitar sobrescritas concorrentes.
++- Denúncias com consulta do conteúdo e encerramento registrado.
++- Profissionais, avaliações, propostas do marketplace e assinaturas em modo de consulta.
++- Administradores com funções e histórico de ações. Configurações mostram os parâmetros efetivamente implementados; não há botões simulados.
++
++As propostas deste painel são as propostas do marketplace, não os orçamentos privados do CRM. A cobrança permanece no fluxo existente. O painel não coleta cartões. A Cly não é ativada por esta mudança.
++
++## Preparar desenvolvimento
++
++Instale as dependências existentes em `backend` com `npm ci`. O admin reutiliza o compilador TypeScript do backend e não acrescenta dependências de execução.
++
++```sh
++npm --prefix backend run typecheck
++npm --prefix backend run test:admin
++npm --prefix backend run build
++npm --prefix admin run build
++```
++
++Use um MySQL local isolado, com banco terminado em `_admin_test`, e as migrações existentes do projeto para criar o esquema completo. Nunca copie credenciais de produção para esse ambiente. Configure também as variáveis obrigatórias descritas no backend.
++
++```sh
++cd backend
++NODE_ENV=test DB_HOST=127.0.0.1 DB_NAME=clyvo_admin_test npm run test:admin:integration
++```
++
++O teste rejeita outros ambientes antes de abrir conexão. Cria contas temporárias, exercita decisões concorrentes, visibilidade pública, denúncias e revogação; remove suas próprias fixtures ao terminar.
++
++## Instalar em um ambiente existente
++
++Antes de habilitar, faça backup do banco e valide em homologação. Este código não foi aplicado ao banco de produção.
++
++1. Compile backend e admin. O Dockerfile já inclui as duas compilações.
++2. Execute **somente** a migração administrativa aditiva, no diretório do backend (ou `/app` no contêiner):
++
++```sh
++node dist/scripts/admin-migrate.js
++```
++
++Ela cria quatro tabelas administrativas. Não execute a migração geral como substituta: a migração geral também contém os seeds de planos existentes.
++
++3. Escolha uma conta ativa existente do responsável. Confira seu ID e e-mail no banco. Autorize o primeiro proprietário pelo terminal protegido do servidor:
++
++```sh
++node dist/scripts/admin-bootstrap.js EMAIL_CONFIRMADO ID_CONFIRMADO
++```
++
++Substitua os dois argumentos. O comando exige correspondência exata e recusa a criação inicial se já houver proprietário ativo. Não use automaticamente a conta de teste da Google Play. A senha é a senha existente dessa conta.
++
++4. Configure o ambiente:
++
++```text
++ADMIN_ENABLED=true
++ADMIN_ORIGIN=https://SEU-DOMINIO-DA-API
++ADMIN_STATIC_DIR=/app/admin
++```
++
++`ADMIN_ORIGIN` é a origem exata, sem `/admin` e sem barra final. Em desenvolvimento pode ser `http://localhost:3000`, usando a porta real. Fora do Docker, o diretório padrão é `../admin/dist`, relativo ao diretório de execução do backend. Mantenha API e painel na mesma origem.
++
++5. Reinicie e abra `https://SEU-DOMINIO-DA-API/admin/`. Entre com a conta autorizada. Cadastre os demais administradores pelo painel, com o menor privilégio necessário.
++
++## Segurança e funções
++
++- Proprietário: administração completa; moderador: conteúdo, denúncias e propostas; suporte: consultas de usuários, conteúdo e propostas; financeiro: assinaturas; auditor: consultas e auditoria.
++- Sessão própria com cookie HttpOnly, Secure em produção e SameSite Strict. Token aleatório armazenado apenas como hash no banco; não usa localStorage.
++- Limite de oito horas e inatividade de trinta minutos; CSRF e validação de origem em alterações; permissões reavaliadas no servidor.
++- Suspensão invalida sessões do usuário. Alteração de permissões revoga sessões administrativas.
++- Não é permitido remover o último proprietário ativo nem alterar o próprio acesso pelo formulário.
++- Ao habilitar o admin, a moderação usa as autorizações administrativas; revise os antigos `MARKET_MODERATOR_USER_IDS` e autorize os moderadores necessários antes da ativação.
++- Defina operacionalmente retenção, acesso e backup do histórico administrativo; não foi inventado um prazo nem adicionada exclusão automática de registros.
++
++## Verificação desta entrega
++
++Typecheck e build do backend, build do admin e 97 verificações sem banco passaram. A integração com MySQL e a validação visual dos módulos autenticados em desktop/celular ainda precisam ser executadas em homologação: não havia MySQL disponível no ambiente de desenvolvimento desta entrega. Não considerar esta etapa como homologação de produção.
+diff --git a/admin/build.mjs b/admin/build.mjs
+new file mode 100644
+index 0000000..5f14b7b
+--- /dev/null
++++ b/admin/build.mjs
+@@ -0,0 +1,3 @@
++import {copyFileSync,mkdirSync} from 'node:fs';
++mkdirSync('dist',{recursive:true});
++for(const file of ['index.html','styles.css','logo.png'])copyFileSync(file,'dist/'+file);
+diff --git a/admin/index.html b/admin/index.html
+new file mode 100644
+index 0000000..a280e11
+--- /dev/null
++++ b/admin/index.html
+@@ -0,0 +1 @@
++<!doctype html><html lang="pt-BR"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="dark"><title>Clyvo Admin</title><link rel="stylesheet" href="./styles.css"></head><body><div id="app"><p class="initial" role="status">Abrindo Clyvo Admin…</p></div><script type="module" src="./main.js"></script></body></html>
+diff --git a/admin/logo.png b/admin/logo.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..a0022e8cf320af456c606230f77150e09e054f8a
+GIT binary patch
+literal 33962
+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
+zck``%0DS`<^}F(ka1<TlSD*|=g#tb?m1@F4)dP$Dml`V@D7}#e@)k}MnLea})e!FX
+zAzY2CnuP?*)sU6iwDZn^q>(0hDTU>+<9S(c@8D}}w$`2BM!HYab^km|ix=5J&dos*
+zI-l<$mb5409e15-nr2o}5lkh<oo1wNHM^Z;f}^hizB5m2vXCb+P(G^sX&u=B-lY~t
+zzSdl#rAeQ<-<26p#+yn}Kx~eLLRC8vZ`SD2t+HHMxlZ*zWzHYvJ}!I|LcAf59;7?Z
+zza}g1qqy&`$*q{>+M9E$F*|u+V=W}5#;9V+_NP@JDe>9fE`8N|+5I^3tJ>YwjPrz=
+zqJ^26dW-8T@n0j6?+S$_UMH*nuixQF`IsSWv`%5sxKMLzI^HHeZieBH#1h8OO{Saw
+ze)+$i`n=TpUaxqW+1{ysbXm3^e@Y=)qjoPGM8i7@?_Xz*^5ytT{jcZ9c_(s=HrxK^
+z0k`sEo}4N#k@AL|J3hRcCi~O4(qIE8q>DJl(4e@SoIoK<yZtemyqd5!7}f~upY&oB
+zd^VI(w6KLea==o?E(Fc)+og>m&G)W<Qc3@$vM{ab4cRt$1yM3)!PD_{)d$?3{jD24
+z>=_C_+Jk`a&Dt^p7>g=(v4f>?)A@f*i<T)y;emYdeziTH#u6M042ab^qqO)R85ogd
+zc)J9-dU0Xrotq4<n>DIk1&E>}Z`?r!66E5?$Bdp?=1v`0IIfldp>|`a?n~tDa{oX8
+z<x7;6?na>Ps70nl+mIYs2DvW|1?4N>pXU*M5ldX_a6WlP6kV8bd_(*{a$@~SL*+GX
+zmAhl(_oq3e&?_arePoB+tA&E1hmApkVnck{5-k{nqbl^|CRcwwdCfDGj5*$nHj(8|
+zmST}VbdWL1>oRKQ{*G5~WRKWYHm`$dhRKsWuJ{YIVI<JL$95+XEsiCasAmTTcEhjs
+zR)atm^~xnW!|yr%RP&MjZ#66h<<0I#gBHd(b?sn*9h}v>`=Z#i-*zCTVq)<Z|Dzt8
+zR-d*j%E$NNtI^~D(unt<bZcY4LJIc-xaIRhm5{H`!BZ2C^^VCe!l}m1>si89F+}P!
+z$ay}IY8cj^XX&FMY4|>YUhhQ(U#<=l_j3S)u!drlmQ6;Kg3fw3Tm&)Q7Fu~YPE}0&
+zC%Ya2k_d&8ZCXhU(VTi5BW^j+#t)dX@<ysiMj_K>8Y1<VkzaZ&oL^jBpb_p7yf)JG
+zSR}jc#Kw6t1%Ime`j_EyKS{#B>Sy(lZajKbHn@Hpg1lSlPjRHUzg5`4z*e8(7^w|^
+z+6hw)RMX<PV&nZ&)c(;Q7CgQj=d#87QXwFqUPq>rbvx{(2R(kH@nudK`%fm6H-%5%
+zGIe$8Yc^3?w5ik()JMChe?@w!MWVu~I`8p!HMz;>-EPkiC?7=U2>wBmK612!1n?Cp
+z=N^%de7K8={DZ}x0{@VQJd(q3<>TwW4Rrd;zrLWuPyhU`Kq`UnqXQKga^OGtzuNpm
+z2V`{ig-HX>pa1@ZKV<tGWX6yM{)rZgzC?Q2`x^wGB1PnH__~9nz(3L17f2ZV4Ie?M
+zvVRee?1DQIqW=VY-2dlF&k)F#{O4Eh-{Mye3A_K8`EOz7e~zpEZLUiH6VHF07qb7n
+r>;8M32><6K@ZTn$$N!1vzeqeWHB>9;6xcof*hb3o8m}v5--i4jc{*N_
+
+literal 0
+HcmV?d00001
+
+diff --git a/admin/package.json b/admin/package.json
+new file mode 100644
+index 0000000..f48bdd3
+--- /dev/null
++++ b/admin/package.json
+@@ -0,0 +1 @@
++{"name":"clyvo-admin","private":true,"version":"1.0.0","scripts":{"typecheck":"node ../backend/node_modules/typescript/bin/tsc --noEmit","build":"node ../backend/node_modules/typescript/bin/tsc && node build.mjs"}}
+diff --git a/admin/src/api.ts b/admin/src/api.ts
+new file mode 100644
+index 0000000..9af6b49
+--- /dev/null
++++ b/admin/src/api.ts
+@@ -0,0 +1,16 @@
++export interface Identity {id:number; name:string; email:string; role:string; permissions:string[]; csrf:string}
++export interface RecordRow {[key:string]:unknown;id:number}
++export interface Page {rows:RecordRow[]; total:number;page:number;pageSize:number}
++export class ApiError extends Error {constructor(message:string,public status:number){super(message)}}
++let csrf='';
++export function setCsrf(value:string){csrf=value;}
++export async function api<T>(path:string,body?:unknown):Promise<T>{
++ const abort=new AbortController();const timer=setTimeout(()=>abort.abort(),15000);
++ try{
++  const response=await fetch('/api/admin'+path,{method:body===undefined?'GET':'POST',credentials:'same-origin',headers:body===undefined?{}:{'Content-Type':'application/json','X-Clyvo-Csrf':csrf},body:body===undefined?undefined:JSON.stringify(body),signal:abort.signal});
++  const result=await response.json().catch(()=>null);
++  if(!response.ok)throw new ApiError(result?.error?.message??(response.status===404?'O painel administrativo ainda não foi habilitado neste servidor.':'Não foi possível concluir a solicitação.'),response.status);
++  if(!result?.success)throw new ApiError('Resposta inválida do servidor.',502);
++  return result.data;
++ }catch(error){if(error instanceof ApiError)throw error;throw new ApiError('Não foi possível conectar. Verifique sua conexão e tente novamente.',0);}finally{clearTimeout(timer);}
++}
+diff --git a/admin/src/main.ts b/admin/src/main.ts
+new file mode 100644
+index 0000000..2a6d058
+--- /dev/null
++++ b/admin/src/main.ts
+@@ -0,0 +1,118 @@
++import {api,ApiError,setCsrf,type Identity,type Page,type RecordRow} from './api.js';
++import {el,button,input,select,field,display,date,money,labels,badge,icon,message,dialog} from './ui.js';
++const root=document.querySelector<HTMLDivElement>('#app')!;
++let identity:Identity;
++let section='dashboard',page=1,search='',status='',generation=0;
++let content:HTMLElement;
++type Column=[string,string,((v:unknown)=>string)?];
++const config:Record<string,{title:string;desc:string;permission:string;columns:Column[];states:string[]}>={
++ users:{title:'Usuários',desc:'Contas e acesso à plataforma.',permission:'users.read',columns:[['name','Nome'],['email','E-mail'],['plan','Plano'],['created_at','Cadastro',date],['last_login_at','Último acesso',date],['status','Situação']],states:['ativo','bloqueado','inativo']},
++ posts:{title:'Oportunidades',desc:'Analise publicações antes que sejam exibidas no marketplace.',permission:'content.read',columns:[['title','Publicação'],['owner','Anunciante'],['category','Categoria'],['budget_from','Valor inicial',money],['created_at','Publicada em',date],['status','Análise']],states:['pending','approved','changes','rejected','suspended']},
++ profiles:{title:'Profissionais',desc:'Perfis, áreas de atuação e avaliações recebidas.',permission:'content.read',columns:[['name','Profissional'],['city','Cidade'],['skills','Áreas de atuação'],['rating','Avaliação'],['status','Análise']],states:['pending','approved','changes','rejected','suspended']},
++ reports:{title:'Denúncias',desc:'Examine o conteúdo e registre uma decisão fundamentada.',permission:'reports',columns:[['id','Nº'],['target_type','Conteúdo'],['reason','Motivo'],['reporter','Denunciante'],['created_at','Recebida em',date],['status','Situação']],states:['aberta','resolvida']},
++ proposals:{title:'Propostas',desc:'Propostas enviadas no marketplace Clyvo.',permission:'proposals',columns:[['title','Oportunidade'],['professional','Profissional'],['amount','Valor',money],['due_date','Prazo',date],['status','Situação']],states:['enviada','aceita','recusada','retirada']},
++ subscriptions:{title:'Assinaturas',desc:'Última assinatura registrada de cada conta. A cobrança é gerenciada pela loja.',permission:'billing',columns:[['name','Usuário'],['plan','Plano'],['effective_status','Situação'],['current_period_end','Fim do período',date],['external_provider','Origem'],['price_paid','Valor registrado',money]],states:['ativa','expirada','cancelada','inadimplente','trialing']},
++ admins:{title:'Administradores',desc:'Autorize contas existentes e defina o acesso de cada pessoa.',permission:'settings',columns:[['name','Nome'],['email','E-mail'],['role','Permissão'],['status','Situação'],['created_at','Autorizado em',date]],states:['ativo','inativo']},
++ audit:{title:'Histórico de ações',desc:'Registro de decisões, autorizações e alterações administrativas.',permission:'audit',columns:[['created_at','Data',date],['actor','Responsável'],['action','Ação'],['target_type','Tipo'],['target_id','Registro'],['reason','Justificativa']],states:[]},
++};
++const can=(p:string)=>identity.permissions.includes(p);
++async function boot(){try{identity=await api<Identity>('/me');setCsrf(identity.csrf);shell();}catch(e){login(e instanceof ApiError&&e.status===401?undefined:(e as Error).message);}}
++function login(error?:string){
++ root.replaceChildren();const wrap=el('main','login');const card=el('section','login-card');
++ const logo=el('div','logo-window');const img=el('img');img.src='./logo.png';img.alt='Clyvo Admin';logo.append(img);
++ card.append(logo,el('span','eyebrow','ACESSO ADMINISTRATIVO'),el('h1','','Tudo sob controle.'),el('p','muted','Entre com sua conta autorizada para gerenciar o Clyvo.'));
++ const form=el('form');const email=input('E-mail','email','voce@empresa.com');email.control.autocomplete='username';email.control.required=true;
++ const password=input('Senha','password','Sua senha do Clyvo');password.control.autocomplete='current-password';password.control.required=true;
++ const alert=el('div');if(error)alert.append(message(error));const submit=el('button','button primary','Entrar no painel');submit.type='submit';
++ form.append(email.wrap,password.wrap,alert,submit);form.onsubmit=async e=>{e.preventDefault();submit.disabled=true;alert.replaceChildren();try{await api('/login',{email:email.control.value,password:password.control.value});password.control.value='';await boot();}catch(err){alert.append(message((err as Error).message));}finally{submit.disabled=false;}};
++ card.append(form,el('p','secure-note','Acesso restrito · Sessão protegida · Ações registradas'));
++ wrap.append(card);root.append(wrap);
++}
++function shell(){
++ root.replaceChildren();const header=el('header','topbar');const menu=button('',()=>document.body.classList.toggle('nav-open'),'icon-button');menu.append(icon('menu'));menu.setAttribute('aria-label','Abrir navegação');
++ const brand=el('a','brand');brand.href='#dashboard';brand.append(el('span','wordmark','Clyvo'),el('span','brand-divider'),el('span','admin-word','Admin'));
++ const global=el('form','global-search');global.append(icon('search'));const g=el('input');g.placeholder='Pesquisar usuários, publicações e profissionais';g.setAttribute('aria-label','Pesquisa global');global.append(g);global.onsubmit=e=>{e.preventDefault();globalSearch(g.value);};
++ const person=el('div','person');person.append(el('span','avatar',identity.name.slice(0,2).toUpperCase()));const details=el('div','person-text');details.append(el('strong','',identity.name),el('span','muted',labels[identity.role]??identity.role));person.append(details,button('Sair',async()=>{try{await api('/logout',{});setCsrf('');login();}catch(e){content.prepend(message((e as Error).message));}},'button ghost'));
++ header.append(menu,brand,global,person);
++ const aside=el('aside','sidebar');aside.append(el('p','nav-caption','WORKSPACE CLYVO'));const nav=el('nav');nav.setAttribute('aria-label','Administração');
++ const items=[['dashboard','Visão geral'],...Object.entries(config).filter(([,v])=>can(v.permission)).map(([k,v])=>[k,v.title])];
++ for(const [key,label]of items){if(key==='admins')nav.append(el('p','nav-caption','ADMINISTRAÇÃO'));const link=el('a','nav-link');link.href='#'+key;link.dataset.section=key;link.append(icon(key),el('span','',label));nav.append(link);}
++ aside.append(nav);const foot=el('div','sidebar-foot');foot.append(icon('admins'),el('span','','Ambiente administrativo'));aside.append(foot);
++ content=el('main','main');content.id='main-content';root.append(header,aside,content);
++ window.onhashchange=()=>{const next=location.hash.slice(1)||'dashboard';if(next==='dashboard'||config[next]&&can(config[next].permission)){section=next;page=1;search='';status='';document.body.classList.remove('nav-open');void render();}};
++ section=location.hash.slice(1)||'dashboard';if(section!=='dashboard'&&(!config[section]||!can(config[section].permission)))section='dashboard';void render();
++}
++function title(name:string,desc:string){const h=el('div','page-heading');const copy=el('div');copy.append(el('div','breadcrumb','Clyvo Admin / '+name),el('h1','',name),el('p','muted',desc));h.append(copy,button('Atualizar',()=>void render(),'button secondary'));return h;}
++function failure(target:HTMLElement,e:unknown){if(e instanceof ApiError&&e.status===401){setCsrf('');login('Sua sessão expirou. Entre novamente.');return;}target.replaceChildren(message((e as Error).message),button('Tentar novamente',()=>void render(),'button secondary'));}
++async function render(){
++ const run=++generation;document.querySelectorAll<HTMLAnchorElement>('.nav-link').forEach(a=>{const active=a.dataset.section===section;a.classList.toggle('active',active);if(active)a.setAttribute('aria-current','page');else a.removeAttribute('aria-current');});
++ content.replaceChildren();if(section==='dashboard'){await dashboard(run);return;}
++ const cfg=config[section];content.append(title(cfg.title,cfg.desc));const toolbar=el('form','toolbar');
++ const s=input('Buscar','search','Nome, e-mail ou título');s.control.value=search;s.control.maxLength=100;
++ const st=select('Situação',[['','Todas'],...cfg.states.map(v=>[v,labels[v]??v] as [string,string])]);st.control.value=status;
++ const submit=el('button','button secondary','Filtrar');submit.type='submit';toolbar.append(s.wrap);if(cfg.states.length)toolbar.append(st.wrap);toolbar.append(submit);toolbar.onsubmit=e=>{e.preventDefault();search=s.control.value;status=st.control.value;page=1;void render();};
++ if(section==='admins')toolbar.append(button('Autorizar administrador',()=>memberForm(),'button primary'));
++ content.append(toolbar);const panel=el('section','panel');panel.append(message('Carregando registros…','loading'));content.append(panel);
++ try{const result=await api<Page>('/'+section+'?'+new URLSearchParams({search,status,page:String(page)}));if(run!==generation)return;panel.replaceChildren();table(panel,section,result);
++ if(section==='admins'){const box=el('section','info-panel');box.append(el('h2','','Permissões e proteção'),el('p','muted','Proprietário: gestão completa. Moderador: conteúdo e denúncias. Suporte: consultas de usuários e conteúdo. Financeiro: assinaturas. Auditor: consultas e histórico.'));
++ const settings=await api<{sessionHours:number;idleMinutes:number;approvalRequired:boolean}>('/settings');if(run!==generation)return;box.append(el('p','muted',`Sessão: ${settings.sessionHours} horas; expiração após ${settings.idleMinutes} minutos sem atividade. Aprovação prévia ${settings.approvalRequired?'obrigatória':'desativada'}.`));content.append(box);}
++ }catch(e){if(run===generation)failure(panel,e);}
++}
++function table(target:HTMLElement,module:string,result:Page,compact=false){
++ const cfg=config[module];const head=el('div','panel-heading');head.append(el('h2','',compact?cfg.title:'Registros'),el('span','count',result.total.toLocaleString('pt-BR')));target.append(head);
++ if(!result.rows.length){const empty=el('div','empty');empty.append(icon(module),el('h3','','Nenhum registro encontrado'),el('p','muted','Os dados aparecerão aqui quando estiverem disponíveis. Confira também os filtros.'));target.append(empty);return;}
++ const scroll=el('div','table-scroll');const table=el('table');const thead=el('thead');const tr=el('tr');for(const [,label]of cfg.columns)tr.append(el('th','',label));
++ const actionable=['users','posts','profiles','reports','proposals','admins'].includes(module);if(actionable)tr.append(el('th','action-column','Ação'));thead.append(tr);const tbody=el('tbody');
++ for(const row of result.rows){const tr=el('tr');for(const [key,,formatter]of cfg.columns){const td=el('td');if(key==='status'||key==='effective_status')td.append(badge(row[key]));else{let val=row[key];if(key==='skills'&&typeof val==='string'){try{val=JSON.parse(val)}catch{ /* Display original text safely. */ }}td.textContent=formatter?formatter(val):labels[String(val)]??display(val);}tr.append(td);}
++ if(actionable){const td=el('td');td.append(button(module==='admins'?'Gerenciar':'Ver detalhes',()=>module==='admins'?memberForm(row):void detail(module,row),'button row-button'));tr.append(td);}tbody.append(tr);}
++ table.append(thead,tbody);scroll.append(table);target.append(scroll);
++ const foot=el('div','table-footer');foot.append(el('span','muted',`${(result.page-1)*result.pageSize+1}–${Math.min(result.page*result.pageSize,result.total)} de ${result.total} registros`));
++ if(!compact){const controls=el('div','pagination');const prev=button('Anterior',()=>{page--;void render();},'button ghost');prev.disabled=page<=1;const next=button('Próxima',()=>{page++;void render();},'button ghost');next.disabled=page*result.pageSize>=result.total;controls.append(prev,el('span','',String(page)),next);foot.append(controls);}else foot.append(button('Ver todos',()=>{location.hash=module;},'button ghost'));target.append(foot);
++}
++async function dashboard(run:number){
++ content.append(title('Visão geral','Acompanhe a plataforma e priorize o que precisa de atenção.'));const area=el('div');area.append(message('Consultando a plataforma…','loading'));content.append(area);
++ try{const data=await api<{counts:Record<string,number>;growth:{month:string;total:number}[];asOf:string}>('/dashboard');if(run!==generation)return;area.replaceChildren();
++ const cards=el('div','stats-grid');const metrics=[['users','Usuários cadastrados','users'],['professionals','Profissionais','profiles'],['opportunities','Oportunidades','posts'],['pending','Aguardando análise','posts'],['proposals','Propostas enviadas','proposals'],['reports','Denúncias pendentes','reports']];
++ for(const [key,label,module]of metrics){const card=el('article','stat-card '+(['pending','reports'].includes(key)?'attention':''));const top=el('div','stat-top');top.append(el('span','muted',label),icon(module));card.append(top,el('strong','stat-value',Number(data.counts[key]??0).toLocaleString('pt-BR')));cards.append(card);}area.append(cards);
++ const lower=el('div','dashboard-grid');const graph=el('section','panel growth');const gh=el('div','panel-heading');gh.append(el('h2','','Crescimento da plataforma'),el('span','muted','Últimos 12 meses'));graph.append(gh,el('p','graph-subtitle','Novos usuários por mês'));
++ const chart=el('div','chart');const months=[];const now=new Date(data.asOf);for(let i=11;i>=0;i--){const d=new Date(Date.UTC(now.getUTCFullYear(),now.getUTCMonth()-i,1));const key=d.toISOString().slice(0,7);months.push({key,label:d.toLocaleDateString('pt-BR',{month:'short',timeZone:'UTC'}),total:Number(data.growth.find(g=>g.month===key)?.total??0)});}const max=Math.max(1,...months.map(m=>m.total));
++ for(const m of months){const col=el('div','chart-column');const value=el('span','chart-value',String(m.total));const bar=el('div','chart-bar');bar.style.height=(m.total/max*140)+'px';bar.title=`${m.key}: ${m.total} usuários`;col.append(value,bar,el('span','chart-label',m.label));chart.append(col);}graph.append(chart);lower.append(graph);
++ const todo=el('section','panel priority');todo.append(el('span','eyebrow','FILA DE TRABALHO'),el('h2','','Próximas decisões'),el('p','muted','Cada análise ajuda a manter a comunidade segura.'));
++ for(const [label,key,module] of [['Publicações em análise','pending','posts'],['Denúncias para revisar','reports','reports']]){if(can(config[module].permission))todo.append(button(`${label} · ${data.counts[key]}`,()=>{location.hash=module;},'task-link'));}
++ todo.append(el('p','secure-note','Somente conteúdo aprovado aparece publicamente.'));lower.append(todo);area.append(lower,el('p','updated','Atualizado em '+date(data.asOf)));
++ if(can('content.read')){const latest=await api<Page>('/posts?status=pending');if(run!==generation)return;const panel=el('section','panel');table(panel,'posts',latest,true);area.append(panel);}
++ }catch(e){if(run===generation)failure(area,e);}
++}
++async function globalSearch(term:string){if(!term.trim())return;const run=++generation;content.replaceChildren(title('Resultados da pesquisa',`Busca por “${term.slice(0,100)}”`));const area=el('div');content.append(area);area.append(message('Pesquisando…','loading'));try{const result=await api<Record<string,Page>>('/search?'+new URLSearchParams({search:term.slice(0,100)}));if(run!==generation)return;area.replaceChildren();for(const [module,data]of Object.entries(result)){const panel=el('section','panel');table(panel,module,data,true);area.append(panel);}}catch(e){if(run===generation)failure(area,e);}}
++function showFields(target:HTMLElement,record:Record<string,unknown>,keys:[string,string][]) {const dl=el('dl','details');for(const [key,label]of keys)dl.append(field(label,record[key]));target.append(dl);}
++function photos(target:HTMLElement,value:unknown){let list=value;if(typeof list==='string'){try{list=JSON.parse(list)}catch{return;}}if(!Array.isArray(list))list=list?[list]:[];const gallery=el('div','gallery');for(const url of list as unknown[]){if(typeof url!=='string'||!/^data:image\/(png|jpeg|webp);base64,/.test(url))continue;const img=el('img');img.src=url;img.alt='Imagem enviada para análise';img.loading='lazy';gallery.append(img);}target.append(gallery);}
++async function detail(module:string,row:RecordRow){
++ const d=dialog(config[module].title+' · #'+row.id);const body=el('div','drawer-body');body.append(message('Carregando detalhes…','loading'));d.append(body);
++ try{
++  if(module==='posts'||module==='profiles'){
++   const type=module==='posts'?'post':'profile';const result=await api<{content:Record<string,unknown>|null;review:{state:string;revision:number;note:string}|null;owner:{id:number;name:string}|null}>(`/content/${type}/${row.id}`);body.replaceChildren();if(!result.content){body.append(message('Conteúdo não encontrado.'));return;}const c=result.content;
++   body.append(el('h3','',display(c.title??c.name)),badge(result.review?.state));if(result.owner)body.append(field('Responsável',result.owner.name));
++   showFields(body,c,module==='posts'?[['description','Descrição'],['category','Categoria'],['city','Cidade'],['budget_from','Valor inicial'],['budget_to','Valor final'],['owner_id','ID do anunciante']]:[['services','Serviços'],['skills','Áreas de atuação'],['experience','Experiência'],['bio','Apresentação'],['city','Cidade']]);photos(body,c.photos??(c.photo?[c.photo]:[]));
++   if(module==='profiles'){const reviews=await api<RecordRow[]>(`/profiles/${row.id}/reviews`);body.append(el('h3','','Avaliações'));if(!reviews.length)body.append(el('p','muted','Nenhuma avaliação registrada.'));for(const r of reviews){const card=el('div','review');card.append(el('strong','',`${r.stars}/5 · ${r.author}`),el('p','',display(r.comment)));body.append(card);}}
++   if(result.review?.note)body.append(message('Última decisão: '+result.review.note,'info'));
++   if(can('content.write')&&result.review){const review=result.review;decisionForm(body,[['approved','Aprovar publicação'],['changes','Solicitar correções'],['rejected','Reprovar publicação'],['suspended','Suspender publicação']],async(action,note)=>{await api(`/content/${type}/${row.id}/decision`,{revision:review.revision,action,note});d.close();await render();});}
++  }else if(module==='reports'){
++   const result=await api<{report:Record<string,unknown>;content:Record<string,unknown>|null;reportedUser:{id:number;name:string}|null}>(`/reports/${row.id}`);body.replaceChildren();showFields(body,result.report,[['reason','Motivo da denúncia'],['target_type','Tipo'],['target_id','ID do conteúdo'],['status','Situação'],['resolution','Decisão anterior']]);
++   if(result.reportedUser)body.append(field('Usuário denunciado',result.reportedUser.name));
++   if(result.content){showFields(body,result.content,[['owner_id','ID do anunciante'],['sender_id','ID do remetente'],['author_id','ID do autor'],['user_id','ID do perfil'],['title','Título'],['name','Nome'],['description','Descrição'],['message','Mensagem'],['comment','Avaliação'],['bio','Apresentação']].filter(([k])=>k in result.content!) as [string,string][]);photos(body,result.content.photos??(result.content.photo?[result.content.photo]:[]));}else body.append(message('O conteúdo denunciado não está mais disponível.','info'));
++   if(result.report.status==='aberta')decisionForm(body,[['ocultar','Ocultar conteúdo / suspender perfil denunciado'],['arquivar','Encerrar sem remoção']],async(action,note)=>{await api(`/reports/${row.id}/resolve`,{action,note});d.close();await render();});
++  }else if(module==='users'){
++   const result=await api<{user:Record<string,unknown>;company:Record<string,unknown>|null}>(`/users/${row.id}`);body.replaceChildren();showFields(body,result.user,[['name','Nome'],['email','E-mail'],['status','Situação'],['last_login_at','Último acesso']]);if(result.company)showFields(body,result.company,[['trade_name','Empresa'],['city','Cidade'],['state','Estado']]);
++   if(can('users.write')&&identity.id!==row.id)decisionForm(body,result.user.status==='bloqueado'?[['ativo','Reativar conta']]:[['bloqueado','Suspender conta']],async(action,note)=>{await api(`/users/${row.id}/status`,{status:action,reason:note});d.close();await render();});
++  }else if(module==='proposals'){
++   const result=await api<Record<string,unknown>>(`/proposals/${row.id}`);body.replaceChildren();showFields(body,result,[['title','Oportunidade'],['professional','Profissional'],['message','Proposta'],['experience','Experiência'],['amount','Valor'],['due_date','Prazo'],['status','Situação']]);
++  }
++ }catch(e){body.replaceChildren(message((e as Error).message));}
++}
++function decisionForm(target:HTMLElement,options:[string,string][],submit:(action:string,note:string)=>Promise<void>){
++ const form=el('form','decision-form');form.append(el('h3','','Registrar decisão'));const action=select('Ação administrativa',options);const label=el('label','field');label.append(el('span','','Justificativa'));const note=el('textarea');note.required=true;note.minLength=5;note.maxLength=450;note.rows=4;note.placeholder='Descreva o motivo da decisão (mínimo de 5 caracteres).';label.append(note);
++ const confirmation=el('label','confirmation');const check=el('input');check.type='checkbox';check.required=true;confirmation.append(check,document.createTextNode('Revisei o conteúdo e confirmo esta ação.'));const error=el('div');const b=el('button','button primary','Confirmar decisão');b.type='submit';form.append(action.wrap,label,confirmation,error,b);form.onsubmit=async e=>{e.preventDefault();b.disabled=true;error.replaceChildren();try{await submit(action.control.value,note.value.trim());}catch(err){error.append(message((err as Error).message));}finally{b.disabled=false;}};target.append(form);
++}
++function memberForm(row?:RecordRow){const d=dialog(row?'Gerenciar administrador':'Autorizar administrador');const body=el('div','drawer-body');d.append(body);const form=el('form');const email=input('E-mail da conta existente','email');email.control.required=true;if(row){email.control.value=String(row.email);email.control.readOnly=true;}
++ const role=select('Permissão',['owner','moderator','support','finance','auditor'].map(r=>[r,labels[r]]));role.control.value=String(row?.role??'support');const state=select('Acesso',[['true','Autorizado'],['false','Revogado']]);state.control.value=row?.status==='inativo'?'false':'true';const reason=input('Justificativa','text','Por que este acesso será alterado?');reason.control.required=true;reason.control.minLength=5;reason.control.maxLength=450;const err=el('div');const b=el('button','button primary','Salvar acesso');b.type='submit';form.append(email.wrap,role.wrap,state.wrap,reason.wrap,el('p','muted','As sessões administrativas anteriores desta pessoa serão encerradas.'),err,b);form.onsubmit=async e=>{e.preventDefault();b.disabled=true;try{await api('/admins',{email:email.control.value,role:role.control.value,enabled:state.control.value==='true',reason:reason.control.value});d.close();await render();}catch(e){err.replaceChildren(message((e as Error).message));}finally{b.disabled=false;}};body.append(form);}
++void boot();
+diff --git a/admin/src/ui.ts b/admin/src/ui.ts
+new file mode 100644
+index 0000000..d2854cb
+--- /dev/null
++++ b/admin/src/ui.ts
+@@ -0,0 +1,14 @@
++export function el<K extends keyof HTMLElementTagNameMap>(tag:K,className='',text?:string){const node=document.createElement(tag);node.className=className;if(text!==undefined)node.textContent=text;return node;}
++export function button(text:string,fn:()=>void,className='button'){const b=el('button',className,text);b.type='button';b.onclick=fn;return b;}
++export function input(label:string,type='text',placeholder=''){const wrap=el('label','field');wrap.append(el('span','',label));const control=el('input');control.type=type;control.placeholder=placeholder;wrap.append(control);return {wrap,control};}
++export function select(label:string,options:[string,string][]){const wrap=el('label','field');wrap.append(el('span','',label));const control=el('select');for(const [v,t] of options){const option=el('option','',t);option.value=v;control.append(option);}wrap.append(control);return {wrap,control};}
++export function field(label:string,value:unknown){const d=el('div','detail-field');d.append(el('dt','',label),el('dd','',display(value)));return d;}
++export const display=(v:unknown):string=>v===null||v===undefined||v===''?'Não informado':Array.isArray(v)?v.join(', '):typeof v==='object'?JSON.stringify(v):String(v);
++export const date=(v:unknown)=>!v?'Não registrado':new Intl.DateTimeFormat('pt-BR',{dateStyle:'short',timeStyle:'short'}).format(new Date(String(v)));
++export const money=(v:unknown)=>v===null||v===undefined?'Não informado':Number(v).toLocaleString('pt-BR',{style:'currency',currency:'BRL'});
++export const labels:Record<string,string>={pending:'Em análise',approved:'Aprovada',rejected:'Reprovada',changes:'Correções solicitadas',suspended:'Suspensa',ativo:'Ativo',bloqueado:'Suspenso',inativo:'Inativo',ativa:'Ativa',expirada:'Expirada',cancelada:'Cancelada',inadimplente:'Pagamento pendente',trialing:'Período de teste',aberta:'Aberta',resolvida:'Resolvida',enviada:'Enviada',aceita:'Aceita',recusada:'Recusada',retirada:'Retirada',owner:'Proprietário',moderator:'Moderador',support:'Suporte',finance:'Financeiro',auditor:'Auditor',post:'Publicação',profile:'Perfil',user:'Usuário',message:'Mensagem',review:'Avaliação'};
++export function badge(value:unknown){const key=String(value??'pending');return el('span','badge '+(['approved','ativo','ativa','resolvida','aceita'].includes(key)?'good':['bloqueado','rejected','suspended','cancelada'].includes(key)?'bad':'neutral'),labels[key]??key);}
++const paths:Record<string,string>={dashboard:'M3 3h7v7H3z M14 3h7v7h-7z M3 14h7v7H3z M14 14h7v7h-7z',users:'M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2 M9 3a4 4 0 1 0 0 8a4 4 0 0 0 0-8 M17 4a4 4 0 0 1 0 8 M22 21v-2a4 4 0 0 0-3-4',posts:'M4 5h16v15H4z M8 2v6 M16 2v6 M4 11h16',profiles:'M12 3a4 4 0 1 0 0 8a4 4 0 0 0 0-8 M4 21v-2a8 8 0 0 1 16 0v2',reports:'M12 3L2 21h20L12 3 M12 9v5 M12 17v1',proposals:'M6 3h9l4 4v14H6z M14 3v5h5 M9 12h7 M9 16h5',subscriptions:'M3 5h18v14H3z M3 10h18 M7 15h3',admins:'M12 2l9 4v6c0 6-9 10-9 10S3 18 3 12V6z M8 12l3 3 5-6',audit:'M4 4h16v16H4z M8 8h8 M8 12h8 M8 16h5',search:'M10 3a7 7 0 1 0 0 14a7 7 0 0 0 0-14 M15 15l6 6',menu:'M4 6h16 M4 12h16 M4 18h16'};
++export function icon(name:string){const svg=document.createElementNS('http://www.w3.org/2000/svg','svg');svg.setAttribute('viewBox','0 0 24 24');svg.setAttribute('fill','none');svg.setAttribute('stroke','currentColor');svg.setAttribute('stroke-width','1.6');svg.setAttribute('aria-hidden','true');const p=document.createElementNS(svg.namespaceURI,'path');p.setAttribute('d',paths[name]??paths.dashboard);svg.append(p);return svg;}
++export function message(text:string,kind='error'){const d=el('div','notice '+kind,text);d.setAttribute('role',kind==='error'?'alert':'status');return d;}
++export function dialog(title:string){const dialog=el('dialog','drawer');const top=el('div','drawer-head');top.append(el('h2','',title),button('×',()=>dialog.close(),'close'));top.lastElementChild?.setAttribute('aria-label','Fechar detalhes');dialog.append(top);document.body.append(dialog);dialog.addEventListener('close',()=>dialog.remove());dialog.showModal();return dialog;}
+diff --git a/admin/styles.css b/admin/styles.css
+new file mode 100644
+index 0000000..9cb9594
+--- /dev/null
++++ b/admin/styles.css
+@@ -0,0 +1,5 @@
++:root{font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#eaecef;background:#101214;font-synthesis:none;--orange:#ff852f;--muted:#9ca3af;--line:#2b2e33;--panel:#191c20;--soft:#22262b}*{box-sizing:border-box}body{margin:0;font-size:14px;line-height:1.5}button,input,select,textarea{font:inherit}button,a,input,select,textarea{-webkit-tap-highlight-color:transparent}button,a{touch-action:manipulation}button{cursor:pointer}button:disabled{opacity:.45;cursor:default}a{color:inherit;text-decoration:none}button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px solid var(--orange);outline-offset:3px}svg{width:20px;height:20px;flex-shrink:0}h1,h2,h3,p{margin:0}h1{font-size:28px;letter-spacing:-.8px;font-weight:650;line-height:1.3}h2{font-size:16px;font-weight:600}h3{font-size:16px}p{line-height:1.6}.muted{color:var(--muted)}.topbar{height:80px;background:#16191c;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:24px;padding:0 28px;position:fixed;inset:0 0 auto;z-index:20}.brand{display:flex;align-items:center;gap:12px;min-width:200px}.wordmark{color:var(--orange);font-size:28px;font-weight:800;letter-spacing:-1.3px}.brand-divider{height:23px;width:1px;background:#41444a}.admin-word{font-size:19px;font-weight:500;letter-spacing:-.3px}.global-search{display:flex;align-items:center;gap:12px;background:#24282d;border:1px solid #30343a;border-radius:8px;padding:0 16px;max-width:600px;flex:1;height:44px;color:var(--muted)}.global-search input{width:100%;background:none;border:0;color:#eee;outline:none;font-size:13px}.person{display:flex;align-items:center;gap:12px;margin-left:auto}.person-text{display:flex;flex-direction:column;font-size:12px}.avatar{height:36px;width:36px;border-radius:50%;background:#3a2a20;color:#ffb47d;display:grid;place-items:center;font-weight:700}.sidebar{position:fixed;top:80px;bottom:0;width:240px;background:#16191c;border-right:1px solid var(--line);padding:24px 16px;display:flex;flex-direction:column;z-index:15;overflow:auto}.nav-caption{font-size:10px;letter-spacing:1.6px;font-weight:700;color:#7f8791;padding:0 16px;margin:0 0 16px}.nav-link{min-height:48px;display:flex;align-items:center;gap:14px;color:#aeb4be;padding:12px 16px;border-radius:7px;margin:4px 0;font-weight:500;font-size:13px}.nav-link:hover{background:#24282c;color:#fff}.nav-link.active{color:#ff9c54;background:#35261d;box-shadow:inset 3px 0 var(--orange)}nav .nav-caption{margin-top:28px}.sidebar-foot{margin-top:auto;padding:32px 12px 0;display:flex;gap:10px;font-size:11px;color:#7f8791}.main{margin:80px 0 0 240px;padding:32px 40px;max-width:1900px}.page-heading{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:28px}.page-heading p{margin-top:8px;font-size:13px}.breadcrumb{color:#838b96;font-size:11px;margin-bottom:16px}.button{border:1px solid var(--line);color:#e4e7ec;background:#22262b;border-radius:7px;padding:11px 16px;min-height:44px;white-space:normal;font-weight:550;font-size:12px}.button:hover:not(:disabled){border-color:#69717c;background:#2a3036}.button.primary{background:var(--orange);border-color:var(--orange);color:#1b1007}.button.primary:hover:not(:disabled){background:#ff9a51}.button.ghost{border-color:transparent;background:transparent;color:#b9bfc9}.row-button{color:#ffad70;background:transparent;border-color:#433126;padding:7px 12px;min-height:36px;font-size:11px}.icon-button{border:0;background:transparent;color:#eee;width:44px;height:44px;display:none;place-items:center}.stats-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;margin-bottom:24px}.stat-card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:20px 24px}.stat-top{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:12px}.stat-top svg{color:#7f8791;width:18px;height:18px}.stat-value{font-size:32px;display:block;margin-top:12px;font-weight:600;letter-spacing:-1px}.stat-card.attention .stat-top svg{color:var(--orange)}.dashboard-grid{display:grid;grid-template-columns:1.65fr 1fr;gap:24px}.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden;margin-bottom:24px}.panel-heading{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:20px 24px;border-bottom:1px solid var(--line)}.panel-heading .muted{font-size:11px}.count{border:1px solid #3b4149;border-radius:6px;padding:2px 8px;color:#b7bec7;font-size:12px}.growth .panel-heading{border:0;padding-bottom:4px}.graph-subtitle{color:var(--muted);font-size:11px;padding:0 24px}.chart{height:226px;display:flex;align-items:flex-end;gap:12px;padding:24px;overflow-x:auto;background:repeating-linear-gradient(to top,transparent 0,transparent 49px,#23272c 50px);background-clip:content-box}.chart-column{flex:1;min-width:20px;text-align:center;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;height:100%;gap:8px}.chart-bar{background:#d97735;width:65%;max-width:30px;border-radius:3px 3px 0 0;min-height:1px}.chart-value{font-size:10px;color:#c7cdd5}.chart-label{font-size:10px;color:#969faa}.priority{padding:24px}.eyebrow{display:block;color:var(--orange);letter-spacing:1.4px;font-size:10px;font-weight:700;margin-bottom:16px}.priority h2{font-size:21px;margin-bottom:8px}.priority p{font-size:12px}.task-link{display:block;width:100%;background:#22262a;border:1px solid var(--line);text-align:left;padding:14px 16px;border-radius:7px;color:#eee;margin-top:16px;font-size:12px}.task-link:hover{border-color:var(--orange)}.secure-note{font-size:11px!important;color:#8d96a1;margin-top:24px}.updated{color:#7e8792;font-size:11px;margin:-8px 0 24px}.toolbar{display:flex;align-items:flex-end;gap:12px;margin-bottom:20px;flex-wrap:wrap}.field{display:flex;flex-direction:column;gap:8px;font-size:12px;color:#b6bec9}.field input,.field select,.field textarea{width:100%;border:1px solid #363c43;background:#191d21;color:#ecedf0;border-radius:7px;padding:11px 14px;min-height:44px}.toolbar .field:first-child{flex:1;min-width:220px;max-width:460px}.toolbar select{min-width:170px}.table-scroll{overflow-x:auto}table{width:100%;border-collapse:collapse;text-align:left;font-size:12px}th{background:#1d2125;color:#98a2ad;font-weight:500;padding:14px 20px;font-size:11px;white-space:nowrap}td{padding:17px 20px;border-top:1px solid #2a2e34;vertical-align:middle;color:#cbd0d8;max-width:320px;overflow-wrap:anywhere}td:first-child{font-weight:550;color:#edf0f4}tbody tr:hover{background:#20252a}.action-column{width:120px}.badge{display:inline-block;padding:4px 9px;border-radius:5px;font-size:10px;font-weight:600;white-space:nowrap}.badge.good{background:#18392d;color:#8dddb9}.badge.bad{background:#3d2428;color:#f3a4ad}.badge.neutral{background:#3a3021;color:#eac28a}.table-footer{display:flex;justify-content:space-between;align-items:center;padding:12px 20px;border-top:1px solid var(--line);font-size:11px;gap:12px}.pagination{display:flex;align-items:center;gap:12px}.empty{padding:56px 24px;text-align:center}.empty svg{width:32px;height:32px;color:#75808b;margin-bottom:12px}.empty p{font-size:12px;margin-top:8px}.notice{padding:16px;border:1px solid #673c3b;color:#ffb4ac;background:#322022;border-radius:8px;font-size:13px;margin:12px}.notice.info,.notice.loading{border-color:#35414d;background:#202930;color:#c6d3df}.info-panel{padding:24px;border:1px solid var(--line);border-radius:8px}.info-panel p{margin-top:12px}.drawer{position:fixed;inset:0 0 0 auto;margin:0;height:100dvh;max-height:100dvh;width:min(600px,100%);max-width:100%;border:0;border-left:1px solid var(--line);background:#181c20;color:#e9edf3;padding:0}.drawer::backdrop{background:#0009;backdrop-filter:blur(2px)}.drawer-head{display:flex;justify-content:space-between;align-items:center;padding:20px 24px;border-bottom:1px solid var(--line);position:sticky;top:0;background:#181c20;z-index:1}.close{width:44px;height:44px;font-size:28px;background:transparent;border:0;color:#c5ccd5}.drawer-body{padding:24px}.drawer-body>h3{font-size:22px;margin-bottom:12px}.details{display:grid;grid-template-columns:1fr;gap:16px;margin:24px 0}.detail-field dt{font-size:11px;color:#8f9aa7;margin-bottom:4px}.detail-field dd{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;font-size:14px}.gallery{display:flex;flex-wrap:wrap;gap:12px}.gallery img{max-width:100%;max-height:260px;object-fit:contain;border-radius:8px;background:#252a2e}.decision-form{border-top:1px solid var(--line);margin-top:32px;padding-top:24px;display:grid;gap:20px}.decision-form textarea{resize:vertical;background:#101417;color:#fff;padding:12px;border:1px solid #3a4249;border-radius:6px}.confirmation{display:flex;align-items:flex-start;gap:10px;font-size:12px;color:#b4bec9}.confirmation input{min-width:20px;height:20px;accent-color:var(--orange)}.drawer-body form:not(.decision-form){display:grid;gap:20px}.review{padding:16px;border:1px solid var(--line);border-radius:8px;margin-top:12px}.review strong{font-size:12px}.review p{font-size:13px;margin-top:8px}.login{min-height:100dvh;display:grid;place-items:center;padding:24px;background:radial-gradient(ellipse at 50% 20%,#33251d 0,transparent 55%),#101214}.login-card{width:min(440px,100%);padding:32px;background:#191c20;border:1px solid var(--line);border-radius:16px}.login-card h1{font-size:26px}.login-card>p{font-size:13px;margin-top:8px}.login-card form{display:grid;gap:20px;margin-top:28px}.logo-window{width:230px;height:60px;overflow:hidden;background:white;border-radius:8px;margin-bottom:32px}.logo-window img{width:300px;max-width:none;transform:translate(-35px,-157px)}.initial{padding:48px;color:#adb5bf}.login-card .notice{margin:0}.login-card .eyebrow{margin-bottom:8px}
++@media(min-width:1500px){.stats-grid{grid-template-columns:repeat(6,minmax(0,1fr))}.stat-card{padding:20px}.main{padding:40px 48px}}
++@media(max-width:1150px){.person-text{display:none}.topbar{gap:16px;padding:0 20px}.brand{min-width:180px}.sidebar{width:210px}.main{margin-left:210px;padding:24px}.dashboard-grid{grid-template-columns:1fr}.priority{display:none}.stat-card{padding:16px}.stat-top{font-size:11px}}
++@media(max-width:760px){.topbar{height:72px;padding:0 12px;gap:8px}.icon-button{display:grid}.brand{min-width:0;gap:8px}.wordmark{font-size:24px}.admin-word{font-size:16px}.global-search{position:absolute;top:84px;left:16px;right:16px;max-width:none;background:#24282d}.person{gap:4px}.person .avatar{display:none}.sidebar{top:72px;transform:translateX(-100%);width:245px;box-shadow:20px 0 40px #0008}.nav-open .sidebar{transform:translateX(0)}.main{margin:140px 0 0;padding:16px}.page-heading{align-items:flex-start;margin-bottom:20px}.page-heading h1{font-size:24px}.page-heading .button{font-size:11px;padding:10px}.breadcrumb{margin-bottom:12px}.stats-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.stat-value{font-size:28px}.stat-top{align-items:flex-start}.stat-top svg{width:16px;height:16px}.panel-heading{padding:16px}.toolbar .field:first-child{min-width:100%;max-width:none}.toolbar select{min-width:140px}.chart{gap:6px;padding:16px}.chart-label{font-size:9px}.table-footer{flex-wrap:wrap}td,th{padding:14px 16px}.row-button{min-height:44px}.drawer-body{padding:20px}.button{min-height:48px}.login-card{padding:24px}.priority{display:block}.sidebar-foot{margin-top:24px}}
++@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important;animation:none!important}}
+diff --git a/admin/tsconfig.json b/admin/tsconfig.json
+new file mode 100644
+index 0000000..70f54ac
+--- /dev/null
++++ b/admin/tsconfig.json
+@@ -0,0 +1 @@
++{"compilerOptions":{"target":"ES2022","module":"ES2022","moduleResolution":"bundler","lib":["ES2022","DOM","DOM.Iterable"],"strict":true,"noUnusedLocals":true,"outDir":"dist","rootDir":"src","skipLibCheck":true},"include":["src/**/*.ts"]}
+diff --git a/backend/package.json b/backend/package.json
+index 15ec5bd..51b99b1 100644
+--- a/backend/package.json
++++ b/backend/package.json
+@@ -24,7 +24,11 @@
+     "test:providers": "node --import tsx src/scripts/provider-test.ts",
+     "test:cly": "node --import tsx src/scripts/cly-test.ts",
+     "test:support": "node --import tsx src/scripts/support-test.ts",
+-    "test:market": "node --import tsx src/scripts/marketplace-test.ts"
++    "test:market": "node --import tsx src/scripts/marketplace-test.ts",
++    "test:admin": "node --import tsx src/scripts/admin.test.ts",
++    "db:admin": "node --import tsx src/scripts/admin-migrate.ts",
++    "build:admin": "cd ../admin && npm run build",
++    "test:admin:integration": "node --import tsx src/scripts/admin-integration.test.ts"
+   },
+   "dependencies": {
+     "bcryptjs": "^2.4.3",
+diff --git a/backend/src/app.ts b/backend/src/app.ts
+index 11e40c6..2af4741 100644
+--- a/backend/src/app.ts
++++ b/backend/src/app.ts
+@@ -1,3 +1,4 @@
++import path from 'node:path';
+ import cors from 'cors';
+ import express, { type Express } from 'express';
+ import helmet from 'helmet';
+@@ -23,7 +24,16 @@ export function createApp(): Express {
+   app.disable('x-powered-by');
+ 
+   // --- Seguranca e infraestrutura ---
+-  app.use(helmet());
++  app.use(helmet({ contentSecurityPolicy: { directives: { upgradeInsecureRequests: env.isProduction ? [] : null } } }));
++  // Admin cookies must never inherit the mobile app's broad CORS allowlist.
++  app.use(env.API_PREFIX + '/admin', (req, res, next) => {
++    const origin = req.get('origin');
++    if (origin && origin !== process.env.ADMIN_ORIGIN) {
++      res.status(403).json({ success: false, error: { message: 'Origem administrativa não autorizada.' } });
++      return;
++    }
++    next();
++  });
+   app.use(
+     cors({
+       origin: env.corsOrigins === '*' ? true : env.corsOrigins,
+@@ -41,6 +51,10 @@ export function createApp(): Express {
+   app.get('/health', asyncHandler(healthController.check));
+   app.use(env.API_PREFIX, apiRoutes);
+ 
++  if (process.env.ADMIN_ENABLED === 'true') {
++    app.use('/admin', express.static(path.resolve(process.cwd(), process.env.ADMIN_STATIC_DIR || '../admin/dist'), { index: 'index.html' }));
++  }
++
+   // --- Fallbacks ---
+   app.use(notFoundHandler);
+   app.use(errorHandler);
+diff --git a/backend/src/modules/admin/permissions.ts b/backend/src/modules/admin/permissions.ts
+new file mode 100644
+index 0000000..335cd76
+--- /dev/null
++++ b/backend/src/modules/admin/permissions.ts
+@@ -0,0 +1,13 @@
++export const roles = ['owner', 'moderator', 'support', 'finance', 'auditor'] as const;
++export type Role = typeof roles[number];
++export const permissions = ['dashboard', 'users.read', 'users.write', 'content.read', 'content.write', 'reports', 'proposals', 'billing', 'settings', 'audit'] as const;
++export type Permission = typeof permissions[number];
++const grants: Record<Role, readonly Permission[]> = {
++ owner: permissions,
++ moderator: ['dashboard','content.read','content.write','reports','proposals'],
++ support: ['dashboard','users.read','content.read','proposals'],
++ finance: ['dashboard','billing'],
++ auditor: ['dashboard','users.read','content.read','proposals','billing','audit'],
++};
++export const allowed = (role: string, permission: Permission) => roles.includes(role as Role) && grants[role as Role].includes(permission);
++export const grantsFor = (role: Role) => grants[role];
+diff --git a/backend/src/modules/admin/routes.ts b/backend/src/modules/admin/routes.ts
+new file mode 100644
+index 0000000..51414d1
+--- /dev/null
++++ b/backend/src/modules/admin/routes.ts
+@@ -0,0 +1,69 @@
++import { Router } from 'express';
++import rateLimit from 'express-rate-limit';
++import { z } from 'zod';
++import { asyncHandler, sendSuccess } from '../../utils/http';
++import { withTransaction, execute, queryOne, type RowDataPacket } from '../../config/database';
++import { marketService } from '../marketplace/service';
++import { allowed, roles, type Permission } from './permissions';
++import { adminEnabled, checkOrigin, checkCsrf, login, me, session, authorize, cookieName, cookieOptions, tokenFrom, hash } from './security';
++import * as service from './service';
++const router=Router();
++router.use((_req,res,next)=>{res.set('Cache-Control','no-store');if(!adminEnabled()){res.status(404).end();return;}next();});
++const throttle=rateLimit({windowMs:15*60*1000,limit:10,standardHeaders:true,legacyHeaders:false,message:{success:false,error:{message:'Muitas tentativas. Aguarde 15 minutos.'}}});
++router.post('/login',throttle,asyncHandler(async(req,res)=>{
++ checkOrigin(req);
++ const input=z.object({email:z.string().email().max(160),password:z.string().min(1).max(200)}).strict().parse(req.body);
++ const token=await login(input.email.trim().toLowerCase(),input.password);
++ const old=tokenFrom(req);if(old)await execute('DELETE FROM admin_sessions WHERE token_hash=?',[hash(old)]);
++ res.cookie(cookieName(),token,cookieOptions());return sendSuccess(res,{authenticated:true});
++}));
++router.use(asyncHandler(async(req,_res,next)=>{const member=await session(req);await execute('UPDATE admin_sessions SET last_seen_at=UTC_TIMESTAMP() WHERE token_hash=?',[member.token_hash]);if(!['GET','HEAD'].includes(req.method))checkCsrf(req);next();}));
++router.get('/me',asyncHandler(async(req,res)=>sendSuccess(res,await me(req))));
++router.post('/logout',asyncHandler(async(req,res)=>{await execute('DELETE FROM admin_sessions WHERE token_hash=?',[hash(tokenFrom(req))]);res.clearCookie(cookieName(),{...cookieOptions(),maxAge:undefined});return sendSuccess(res,{loggedOut:true});}));
++const permissionFor:Record<service.Module,Permission>={users:'users.read',posts:'content.read',profiles:'content.read',reports:'reports',proposals:'proposals',subscriptions:'billing',admins:'settings',audit:'audit'};
++const filter=z.object({search:z.string().trim().max(100).default(''),status:z.string().max(40).default(''),page:z.coerce.number().int().min(1).max(100000).default(1)}).strict();
++const id=(x:unknown)=>z.coerce.number().int().positive().max(Number.MAX_SAFE_INTEGER).parse(x);
++router.get('/dashboard',asyncHandler(async(req,res)=>{await authorize(req,'dashboard');return sendSuccess(res,await service.dashboard());}));
++router.get('/search',asyncHandler(async(req,res)=>{
++ const member=await session(req);const f=filter.parse(req.query);const result:Record<string,unknown>={};
++ for(const m of ['users','posts','profiles','proposals'] as service.Module[])if(allowed(member.role,permissionFor[m]))result[m]=await service.list(m,{...f,page:1});
++ return sendSuccess(res,result);
++}));
++router.get('/settings',asyncHandler(async(req,res)=>{await authorize(req,'settings');return sendSuccess(res,{approvalRequired:true,sessionHours:8,idleMinutes:30,roles});}));
++for(const m of service.modules)router.get('/'+m,asyncHandler(async(req,res)=>{await authorize(req,permissionFor[m]);return sendSuccess(res,await service.list(m,filter.parse(req.query)));}));
++router.get('/users/:id',asyncHandler(async(req,res)=>{await authorize(req,'users.read');return sendSuccess(res,await service.userDetail(id(req.params.id)));}));
++router.get('/proposals/:id',asyncHandler(async(req,res)=>{await authorize(req,'proposals');return sendSuccess(res,await service.proposalDetail(id(req.params.id)));}));
++router.get('/profiles/:id/reviews',asyncHandler(async(req,res)=>{await authorize(req,'content.read');return sendSuccess(res,await service.reviews(id(req.params.id)));}));
++// Reuse existing content review service. Readers are restricted to administrators with content permission.
++router.get('/content/:type/:id',asyncHandler(async(req,res)=>{
++ const member=await authorize(req,'content.read');const type=z.enum(['post','profile']).parse(req.params.type);
++ // Existing moderation service has the stricter moderator requirement; read-only admins use bounded SQL below.
++ const target=id(req.params.id);
++ const content=await queryOne<RowDataPacket>(type==='post'?'SELECT * FROM market_posts WHERE id=?':'SELECT * FROM market_profiles WHERE user_id=?',[target]);
++ const review=await queryOne('SELECT state,revision,note FROM market_content_reviews WHERE target_type=? AND target_id=?',[type,target]);
++ void member;
++ const ownerId=content?.owner_id??content?.user_id;
++ const owner=ownerId?await queryOne('SELECT id,name FROM users WHERE id=?',[ownerId]):null;
++ return sendSuccess(res,{type,id:target,content,review,owner});
++}));
++router.get('/reports/:id',asyncHandler(async(req,res)=>{const member=await authorize(req,'reports');const data=await marketService.reportContent(member.id,id(req.params.id));const c=data.content;const userId=c?.owner_id??c?.sender_id??c?.author_id??c?.user_id;const reportedUser=userId?await queryOne('SELECT id,name FROM users WHERE id=?',[userId]):null;return sendSuccess(res,{...data,reportedUser});}));
++const reason=z.string().trim().min(5).max(450);
++router.post('/content/:type/:id/decision',asyncHandler(async(req,res)=>{
++ const body=z.object({revision:z.number().int().positive(),action:z.enum(['approved','rejected','changes','suspended']),note:reason}).strict().parse(req.body);
++ const type=z.enum(['post','profile']).parse(req.params.type);
++ const result=await withTransaction(async()=>{const member=await authorize(req,'content.write',true);return marketService.decideContent(member.id,type,id(req.params.id),body);});
++ return sendSuccess(res,result);
++}));
++router.post('/reports/:id/resolve',asyncHandler(async(req,res)=>{
++ const body=z.object({action:z.enum(['ocultar','arquivar']),note:reason}).strict().parse(req.body);
++ const result=await withTransaction(async()=>{const member=await authorize(req,'reports',true);return marketService.resolve(member.id,id(req.params.id),body);});return sendSuccess(res,result);
++}));
++router.post('/users/:id/status',asyncHandler(async(req,res)=>{
++ const body=z.object({status:z.enum(['ativo','bloqueado']),reason}).strict().parse(req.body);
++ return sendSuccess(res,await service.changeUser(req,id(req.params.id),body.status,body.reason));
++}));
++router.post('/admins',asyncHandler(async(req,res)=>{
++ const body=z.object({email:z.string().email().max(160),role:z.enum(roles),enabled:z.boolean(),reason}).strict().parse(req.body);
++ return sendSuccess(res,await service.changeMember(req,body.email,body.role,body.enabled,body.reason));
++}));
++export {router as adminRoutes};
+diff --git a/backend/src/modules/admin/security.ts b/backend/src/modules/admin/security.ts
+new file mode 100644
+index 0000000..5c0d1b5
+--- /dev/null
++++ b/backend/src/modules/admin/security.ts
+@@ -0,0 +1,60 @@
++import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
++import type { Request, Response, NextFunction } from 'express';
++import { queryOne, execute, type RowDataPacket as Row } from '../../config/database';
++import { env } from '../../config/env';
++import { AppError } from '../../utils/app-error';
++import { fakePasswordCheck, verifyPassword } from '../../utils/password';
++import { allowed, grantsFor, type Permission, type Role } from './permissions';
++export const adminEnabled = () => process.env.ADMIN_ENABLED === 'true';
++export const hash = (text: string) => createHash('sha256').update(text).digest('hex');
++export const cookieName = () => env.isProduction ? '__Host-clyvo-admin' : 'clyvo_admin';
++export const cookieOptions = () => ({ httpOnly: true, secure: env.isProduction, sameSite: 'strict' as const, path: '/', maxAge: 8*3600*1000 });
++export function tokenFrom(req: Request) {
++ const raw = (req.headers.cookie ?? '').split(';').map(v=>v.trim()).find(v=>v.startsWith(cookieName()+'='))?.slice(cookieName().length+1) ?? '';
++ return /^[a-f0-9]{64}$/.test(raw) ? raw : '';
++}
++export function checkOrigin(req: Request) {
++ const configured = process.env.ADMIN_ORIGIN;
++ if (!configured || (env.isProduction && !configured.startsWith('https://')) || req.get('origin') !== configured) throw AppError.forbidden('Origem administrativa não autorizada.');
++}
++export function checkCsrf(req: Request) {
++ checkOrigin(req);
++ const token = tokenFrom(req); const supplied = req.get('x-clyvo-csrf') ?? '';
++ const expected = hash('admin-csrf:'+token);
++ if (!token || !/^[a-f0-9]{64}$/.test(supplied) || !timingSafeEqual(Buffer.from(supplied),Buffer.from(expected))) throw AppError.forbidden('Sessão inválida. Atualize a página.');
++}
++export async function audit(actor: number | null, action: string, type: string, id: number | null, reason='', metadata: unknown=null) {
++ await execute('INSERT INTO admin_audit(actor_id,action,target_type,target_id,reason,metadata) VALUES(?,?,?,?,?,?)',[actor,action,type,id,reason,metadata===null?null:JSON.stringify(metadata)]);
++}
++export async function session(req: Request, lock=false) {
++ const token=tokenFrom(req); if(!token) throw AppError.unauthorized('Entre no Clyvo Admin.');
++ const row=await queryOne<Row>(`SELECT u.id,u.name,u.email,m.role,s.token_hash FROM admin_sessions s
++ JOIN users u ON u.id=s.user_id JOIN admin_members m ON m.user_id=u.id
++ LEFT JOIN session_security v ON v.user_id=u.id
++ WHERE s.token_hash=? AND s.expires_at>UTC_TIMESTAMP() AND s.last_seen_at>DATE_SUB(UTC_TIMESTAMP(),INTERVAL 30 MINUTE)
++ AND s.security_version=COALESCE(v.version,0) AND m.enabled=1 AND u.status='ativo' AND u.deleted_at IS NULL ${lock?'FOR UPDATE':''}`,[hash(token)]);
++ if(!row) throw AppError.unauthorized('Sua sessão expirou ou foi revogada. Entre novamente.');
++ return row;
++}
++export async function authorize(req: Request, permission: Permission, lock=false) {
++ const member=await session(req,lock);
++ if(!allowed(member.role,permission)) throw AppError.forbidden('Você não tem permissão para esta ação.');
++ return member;
++}
++export const guard=(permission: Permission)=>(req: Request,_res:Response,next:NextFunction)=>{authorize(req,permission).then(()=>next(),next);};
++export async function login(email:string,password:string) {
++ const user=await queryOne<Row>(`SELECT u.id,u.password_hash,u.status,u.deleted_at,m.role,m.enabled,COALESCE(v.version,0) version
++ FROM users u LEFT JOIN admin_members m ON m.user_id=u.id LEFT JOIN session_security v ON v.user_id=u.id WHERE u.email=?`,[email]);
++ const valid=user ? await verifyPassword(password,user.password_hash) : (await fakePasswordCheck(),false);
++ if(!valid || !user || !user.enabled || user.status!=='ativo' || user.deleted_at || !allowed(user.role,'dashboard')) throw AppError.unauthorized('E-mail, senha ou acesso administrativo inválidos.');
++ const token=randomBytes(32).toString('hex');
++ await execute('DELETE FROM admin_sessions WHERE expires_at<=UTC_TIMESTAMP() OR last_seen_at<=DATE_SUB(UTC_TIMESTAMP(),INTERVAL 30 MINUTE)');
++ await execute('INSERT INTO admin_sessions(token_hash,user_id,security_version,expires_at) VALUES(?,?,?,DATE_ADD(UTC_TIMESTAMP(),INTERVAL 8 HOUR))',[hash(token),user.id,user.version]);
++ await audit(user.id,'session.login','admin',user.id);
++ return token;
++}
++export async function me(req: Request) {
++ const member=await session(req);
++ await execute('UPDATE admin_sessions SET last_seen_at=UTC_TIMESTAMP() WHERE token_hash=?',[member.token_hash]);
++ return {id:member.id,name:member.name,email:member.email,role:member.role,permissions:grantsFor(member.role as Role),csrf:hash('admin-csrf:'+tokenFrom(req))};
++}
+diff --git a/backend/src/modules/admin/service.ts b/backend/src/modules/admin/service.ts
+new file mode 100644
+index 0000000..2ef8844
+--- /dev/null
++++ b/backend/src/modules/admin/service.ts
+@@ -0,0 +1,85 @@
++import { query, queryOne, execute, withTransaction, type RowDataPacket as Row } from '../../config/database';
++import type { Request } from 'express';
++import { AppError } from '../../utils/app-error';
++import { audit, authorize } from './security';
++import type { Role } from './permissions';
++export interface Filter { search: string; status: string; page: number }
++const q=(sql:string,args:unknown[]=[])=>query<Row>(sql,args);
++const one=(sql:string,args:unknown[]=[])=>queryOne<Row>(sql,args);
++const like=(s:string)=>'%'+s.replace(/[\\%_]/g, c=>'\\'+c)+'%';
++export const modules=['users','posts','profiles','reports','proposals','subscriptions','admins','audit'] as const;
++export type Module=typeof modules[number];
++const definitions: Record<Module,{from:string; fields:string; search:string[]; status:string; order:string; base?:string}> = {
++ users:{from:`users u LEFT JOIN subscriptions s ON s.id=(SELECT MAX(id) FROM subscriptions WHERE user_id=u.id) LEFT JOIN plans p ON p.id=s.plan_id`,fields:'u.id,u.name,u.email,u.status,u.created_at,u.last_login_at,p.name plan',search:['u.name','u.email'],status:'u.status',order:'u.id',base:'u.deleted_at IS NULL'},
++ posts:{from:`market_posts p JOIN users u ON u.id=p.owner_id LEFT JOIN market_content_reviews r ON r.target_type='post' AND r.target_id=p.id`,fields:'p.id,p.title,u.name owner,p.category,p.budget_from,p.budget_to,p.created_at,p.status publication_status,r.state status,r.revision,p.hidden',search:['p.title','u.name','p.category'],status:'r.state',order:'p.id'},
++ profiles:{from:`market_profiles p JOIN users u ON u.id=p.user_id LEFT JOIN market_content_reviews r ON r.target_type='profile' AND r.target_id=p.user_id`,fields:`p.user_id id,p.name,u.email,p.city,p.skills,p.published,r.state status,r.revision,(SELECT AVG(stars) FROM market_reviews WHERE target_id=p.user_id AND hidden=0) rating`,search:['p.name','u.email','p.city'],status:'r.state',order:'p.user_id'},
++ reports:{from:'market_reports r JOIN users u ON u.id=r.reporter_id',fields:'r.id,r.target_type,r.target_id,r.reason,r.status,r.created_at,u.name reporter',search:['r.reason','u.name'],status:'r.status',order:'r.id'},
++ proposals:{from:'market_proposals a JOIN market_posts p ON p.id=a.post_id JOIN users u ON u.id=a.professional_id',fields:'a.id,p.title,u.name professional,a.amount,a.due_date,a.status,a.created_at',search:['p.title','u.name'],status:'a.status',order:'a.id'},
++ subscriptions:{from:'subscriptions s JOIN users u ON u.id=s.user_id JOIN plans p ON p.id=s.plan_id',fields:`s.id,u.name,u.email,p.name plan,s.status,s.current_period_end,s.external_provider,s.price_paid,CASE WHEN s.current_period_end IS NOT NULL AND s.current_period_end<=UTC_TIMESTAMP() AND s.status IN ('ativa','trialing','inadimplente') THEN 'expirada' ELSE s.status END effective_status`,search:['u.name','u.email','p.name'],status:"CASE WHEN s.current_period_end IS NOT NULL AND s.current_period_end<=UTC_TIMESTAMP() AND s.status IN ('ativa','trialing','inadimplente') THEN 'expirada' ELSE s.status END",order:'s.id',base:'s.id=(SELECT MAX(latest.id) FROM subscriptions latest WHERE latest.user_id=s.user_id)'},
++ admins:{from:'admin_members m JOIN users u ON u.id=m.user_id',fields:"u.id,u.name,u.email,m.role,IF(m.enabled=1,'ativo','inativo') status,m.created_at",search:['u.name','u.email'],status:"IF(m.enabled=1,'ativo','inativo')",order:'u.id'},
++ audit:{from:'admin_audit a LEFT JOIN users u ON u.id=a.actor_id',fields:'a.id,u.name actor,a.action,a.target_type,a.target_id,a.reason,a.created_at',search:['a.action','a.reason','u.name'],status:'a.action',order:'a.id'},
++};
++export async function list(module:Module,f:Filter) {
++ const d=definitions[module];const args:unknown[]=[];const where=[d.base??'1=1'];
++ if(f.search){where.push('('+d.search.map(c=>c+' LIKE ?').join(' OR ')+')');args.push(...d.search.map(()=>like(f.search)));}
++ if(f.status){where.push(d.status+'=?');args.push(f.status);}
++ const sql=`FROM ${d.from} WHERE ${where.join(' AND ')}`;
++ const total=Number((await one('SELECT COUNT(*) total '+sql,args))?.total??0);
++ const rows=await q(`SELECT ${d.fields} ${sql} ORDER BY ${d.order} DESC LIMIT 25 OFFSET ?`,[...args,(f.page-1)*25]);
++ return {rows,total,page:f.page,pageSize:25};
++}
++export async function dashboard() {
++ const counts=await one(`SELECT (SELECT COUNT(*) FROM users WHERE deleted_at IS NULL) users,
++ (SELECT COUNT(*) FROM market_profiles) professionals,(SELECT COUNT(*) FROM market_posts) opportunities,
++ (SELECT COUNT(*) FROM market_content_reviews WHERE state='pending') pending,
++ (SELECT COUNT(*) FROM market_proposals) proposals,(SELECT COUNT(*) FROM market_reports WHERE status='aberta') reports`);
++ const growth=await q("SELECT DATE_FORMAT(created_at,'%Y-%m') month,COUNT(*) total FROM users WHERE deleted_at IS NULL AND created_at>=DATE_FORMAT(DATE_SUB(UTC_DATE(),INTERVAL 11 MONTH),'%Y-%m-01') GROUP BY month ORDER BY month");
++ return {counts,growth,asOf:new Date().toISOString()};
++}
++export async function userDetail(id:number) {
++ const user=await one('SELECT id,name,email,status,created_at,last_login_at FROM users WHERE id=? AND deleted_at IS NULL',[id]);
++ if(!user)throw AppError.notFound();
++ return {user,company:await one('SELECT trade_name,city,state FROM companies WHERE user_id=?',[id])};
++}
++export async function proposalDetail(id:number) {
++ const result=await one('SELECT a.id,a.message,a.experience,a.amount,a.due_date,a.status,p.title,u.name professional FROM market_proposals a JOIN market_posts p ON p.id=a.post_id JOIN users u ON u.id=a.professional_id WHERE a.id=?',[id]);
++ if(!result)throw AppError.notFound();return result;
++}
++export async function reviews(id:number) { return q('SELECT r.id,r.stars,r.comment,r.created_at,r.hidden,u.name author FROM market_reviews r JOIN users u ON u.id=r.author_id WHERE r.target_id=? ORDER BY r.id DESC LIMIT 100',[id]); }
++export async function changeUser(req:Request,id:number,status:'ativo'|'bloqueado',reason:string) {
++ return withTransaction(async()=>{
++  // All membership and account restrictions use this same lock order.
++  await one('SELECT id FROM admin_control WHERE id=1 FOR UPDATE');
++  const actor=await authorize(req,'users.write',true);
++  if(actor.id===id)throw AppError.conflict('Você não pode suspender sua própria conta.');
++  if(await one('SELECT user_id FROM admin_members WHERE user_id=? AND enabled=1',[id]))throw AppError.conflict('Revogue o acesso administrativo antes de suspender esta conta.');
++  const user=await one('SELECT status FROM users WHERE id=? AND deleted_at IS NULL FOR UPDATE',[id]);
++  if(!user)throw AppError.notFound();
++  await execute('UPDATE users SET status=? WHERE id=?',[status,id]);
++  if(status==='bloqueado'){
++   await execute('INSERT INTO session_security(user_id,version) VALUES(?,1) ON DUPLICATE KEY UPDATE version=version+1',[id]);
++   await execute('DELETE FROM refresh_tokens WHERE user_id=?',[id]);
++   await execute('DELETE FROM admin_sessions WHERE user_id=?',[id]);
++  }
++  await audit(actor.id,'user.status','user',id,reason,{before:user.status,after:status});
++  return {status};
++ });
++}
++export async function changeMember(req:Request,email:string,role:Role,enabled:boolean,reason:string) {
++ return withTransaction(async()=>{
++  await one('SELECT id FROM admin_control WHERE id=1 FOR UPDATE');
++  const actor=await authorize(req,'settings',true);
++  const target=await one("SELECT id FROM users WHERE email=? AND status='ativo' AND deleted_at IS NULL FOR UPDATE",[email]);
++  if(!target)throw AppError.notFound('Cadastre primeiro uma conta ativa no Clyvo com este e-mail.');
++  if(target.id===actor.id)throw AppError.conflict('Outro proprietário deve alterar seu acesso.');
++  const prior=await one('SELECT role,enabled FROM admin_members WHERE user_id=? FOR UPDATE',[target.id]);
++  if(prior?.role==='owner' && prior.enabled && (!enabled || role!=='owner')){
++   const count=await one("SELECT COUNT(*) n FROM admin_members m JOIN users u ON u.id=m.user_id WHERE m.role='owner' AND m.enabled=1 AND u.status='ativo' AND u.deleted_at IS NULL");
++   if(Number(count?.n)<=1)throw AppError.conflict('Mantenha pelo menos um proprietário ativo.');
++  }
++  await execute('INSERT INTO admin_members(user_id,role,enabled) VALUES(?,?,?) ON DUPLICATE KEY UPDATE role=VALUES(role),enabled=VALUES(enabled)',[target.id,role,enabled?1:0]);
++  await execute('DELETE FROM admin_sessions WHERE user_id=?',[target.id]);
++  await audit(actor.id,'admin.access','user',target.id,reason,{before:prior,after:{role,enabled}});
++  return {id:target.id,role,enabled};
++ });
++}
+diff --git a/backend/src/modules/marketplace/service.ts b/backend/src/modules/marketplace/service.ts
+index 196db20..6e390fa 100644
+--- a/backend/src/modules/marketplace/service.ts
++++ b/backend/src/modules/marketplace/service.ts
+@@ -1,3 +1,4 @@
++import { audit } from '../admin/security';
+ import { execute, query, queryOne, withTransaction, type RowDataPacket as Row } from '../../config/database';
+ import { userRepository } from '../../repositories/user.repository';
+ import { clientRepository } from '../../repositories/client.repository';
+@@ -22,13 +23,20 @@ const approx = (v: number | null) => (v === null ? null : Math.round(v * 100) /
+ const date = (v: any) => (v instanceof Date ? v.toISOString().slice(0, 10) : String(v ?? '').slice(0, 10));
+ const row = (sql: string, args: unknown[] = []) => queryOne<Row>(sql, args);
+ const rows = (sql: string, args: unknown[] = []) => query<Row>(sql, args);
+-export const isModerator = (id: number) =>
++const legacyModerator = (id: number) =>
+   (process.env.MARKET_MODERATOR_USER_IDS ?? '')
+     .split(',')
+     .map((v) => v.trim())
+     .filter(Boolean)
+     .includes(String(id));
++export async function isModerator(id: number): Promise<boolean> {
++  if (process.env.ADMIN_ENABLED !== 'true') return legacyModerator(id);
++  const member = await row("SELECT m.role FROM admin_members m JOIN users u ON u.id=m.user_id WHERE m.user_id=? AND m.enabled=1 AND u.status='ativo' AND u.deleted_at IS NULL",[id]);
++  return member?.role === 'owner' || member?.role === 'moderator';
++}
+ async function active(id: number) {
++  const user=await row("SELECT id FROM users WHERE id=? AND status='ativo' AND deleted_at IS NULL",[id]);
++  if(!user) throw AppError.forbidden('Conta indisponível.');
+   if (await row('SELECT user_id FROM market_suspensions WHERE user_id=?', [id]))
+     throw AppError.forbidden(
+       'Seu acesso de publicacao ao marketplace foi suspenso. Entre em contato com o suporte.',
+@@ -119,8 +127,8 @@ async function mutateWork<T>(actor: number, id: number, fn: (w: Row) => Promise<
+   });
+ }
+ const hideBlocked = `NOT EXISTS(SELECT 1 FROM market_blocks b WHERE (b.user_id=? AND b.target_id=p.owner_id) OR (b.target_id=? AND b.user_id=p.owner_id))`;
+-const approvedPost = `EXISTS(SELECT 1 FROM market_content_reviews cr WHERE cr.target_type='post' AND cr.target_id=p.id AND cr.state='approved')`;
+-const approvedProfile = `EXISTS(SELECT 1 FROM market_content_reviews cr WHERE cr.target_type='profile' AND cr.target_id=p.user_id AND cr.state='approved')`;
++const approvedPost = `EXISTS(SELECT 1 FROM users active_owner WHERE active_owner.id=p.owner_id AND active_owner.status='ativo' AND active_owner.deleted_at IS NULL) AND EXISTS(SELECT 1 FROM market_content_reviews cr WHERE cr.target_type='post' AND cr.target_id=p.id AND cr.state='approved')`;
++const approvedProfile = `EXISTS(SELECT 1 FROM users active_owner WHERE active_owner.id=p.user_id AND active_owner.status='ativo' AND active_owner.deleted_at IS NULL) AND EXISTS(SELECT 1 FROM market_content_reviews cr WHERE cr.target_type='profile' AND cr.target_id=p.user_id AND cr.state='approved')`;
+ async function queueContent(type: 'post' | 'profile', target: number, owner: number) {
+   await execute(`INSERT INTO market_content_reviews(target_type,target_id,owner_id) VALUES(?,?,?)
+     ON DUPLICATE KEY UPDATE state='pending',revision=revision+1,note='',moderator_id=NULL`, [type,target,owner]);
+@@ -152,7 +160,7 @@ export const marketService = {
+       plan: p,
+       usage,
+       rulesVersion: RULES_VERSION,
+-      moderator: isModerator(id),
++      moderator: await isModerator(id),
+       stats: profile ? (await marketService.profile(id, id)).stats : null,
+       categories,
+     };
+@@ -727,7 +735,7 @@ export const marketService = {
+     return { id: result.insertId, emailed };
+   },
+   async moderation(actor: number) {
+-    if (!isModerator(actor)) throw AppError.forbidden('Acesso restrito a moderacao.');
++    if (!await isModerator(actor)) throw AppError.forbidden('Acesso restrito a moderacao.');
+     return {
+       queue: await rows(`SELECT cr.*,IF(cr.target_type='post',p.title,mp.name) title
+         FROM market_content_reviews cr LEFT JOIN market_posts p ON cr.target_type='post' AND p.id=cr.target_id
+@@ -741,7 +749,7 @@ export const marketService = {
+     };
+   },
+   async reviewContent(actor: number, type: 'post' | 'profile', id: number) {
+-    if (!isModerator(actor)) throw AppError.forbidden('Acesso restrito à moderação.');
++    if (!await isModerator(actor)) throw AppError.forbidden('Acesso restrito à moderação.');
+     return withTransaction(async () => {
+       const owner = await row('SELECT owner_id FROM market_content_reviews WHERE target_type=? AND target_id=?', [type,id]);
+       if (!owner) throw AppError.notFound('Conteúdo não encontrado.');
+@@ -751,26 +759,27 @@ export const marketService = {
+       return { type, id, review, content };
+     });
+   },
+-  async decideContent(actor: number, type: 'post' | 'profile', id: number, input: { revision: number; action: 'approved' | 'rejected'; note: string }) {
+-    if (!isModerator(actor)) throw AppError.forbidden('Acesso restrito à moderação.');
++  async decideContent(actor: number, type: 'post' | 'profile', id: number, input: { revision: number; action: 'approved' | 'rejected' | 'changes' | 'suspended'; note: string }) {
++    if (!await isModerator(actor)) throw AppError.forbidden('Acesso restrito à moderação.');
+     return withTransaction(async () => {
+       const initial = await row('SELECT owner_id FROM market_content_reviews WHERE target_type=? AND target_id=?', [type,id]);
+       if (!initial) throw AppError.notFound('Conteúdo não encontrado.');
+       await lockUsers(initial.owner_id);
+       await active(initial.owner_id);
+       const review = await row('SELECT * FROM market_content_reviews WHERE target_type=? AND target_id=? FOR UPDATE', [type,id]);
+-      if (!review || review.state !== 'pending' || review.revision !== input.revision)
++      if (!review || review.revision !== input.revision)
+         throw AppError.conflict('O conteúdo foi alterado ou já foi analisado. Reabra antes de decidir.');
+       const content = await row(type === 'post' ? 'SELECT * FROM market_posts WHERE id=? FOR UPDATE' : 'SELECT * FROM market_profiles WHERE user_id=? FOR UPDATE', [id]);
+       if (!content || (type === 'post' ? content.hidden || content.status !== 'aberta' : !content.published))
+         throw AppError.conflict('Este conteúdo não está mais disponível para publicação.');
+-      await execute('UPDATE market_content_reviews SET state=?,note=?,moderator_id=? WHERE target_type=? AND target_id=?', [input.action,input.note,actor,type,id]);
++      await execute('UPDATE market_content_reviews SET state=?,note=?,moderator_id=?,revision=revision+1 WHERE target_type=? AND target_id=?', [input.action,input.note,actor,type,id]);
+       await execute('INSERT INTO market_content_decisions(target_type,target_id,revision,decision,note,moderator_id) VALUES(?,?,?,?,?,?)', [type,id,input.revision,input.action,input.note,actor]);
++      if (process.env.ADMIN_ENABLED === 'true') await audit(actor,'content.'+input.action,type,id,input.note,{revision:input.revision});
+       return { state: input.action };
+     });
+   },
+   async reportContent(actor: number, id: number) {
+-    if (!isModerator(actor)) throw AppError.forbidden('Acesso restrito a moderacao.');
++    if (!await isModerator(actor)) throw AppError.forbidden('Acesso restrito a moderacao.');
+     const report = await row('SELECT * FROM market_reports WHERE id=?', [id]);
+     if (!report) throw AppError.notFound('Denuncia nao encontrada.');
+     const sql: Record<string, string> = {
+@@ -782,7 +791,7 @@ export const marketService = {
+     return { report, content: await row(sql[report.target_type], [report.target_id]) };
+   },
+   async resolve(actor: number, id: number, input: { action: string; note: string }) {
+-    if (!isModerator(actor)) throw AppError.forbidden('Acesso restrito a moderacao.');
++    if (!await isModerator(actor)) throw AppError.forbidden('Acesso restrito a moderacao.');
+     return withTransaction(async () => {
+       const report = await row('SELECT * FROM market_reports WHERE id=? FOR UPDATE', [id]);
+       if (!report) throw AppError.notFound('Denuncia nao encontrada.');
+@@ -806,13 +815,17 @@ export const marketService = {
+         "UPDATE market_reports SET status='resolvida',resolution=?,moderator_id=?,resolved_at=UTC_TIMESTAMP() WHERE id=?",
+         [input.action + ': ' + input.note, actor, id],
+       );
++      if (process.env.ADMIN_ENABLED === 'true') await audit(actor,'report.resolve','report',id,input.note,{action:input.action});
+       return { resolved: true };
+     });
+   },
+   async restoreUser(actor: number, target: number) {
+-    if (!isModerator(actor)) throw AppError.forbidden('Acesso restrito a moderacao.');
+-    await execute('DELETE FROM market_suspensions WHERE user_id=?', [target]);
+-    return { restored: true };
++    if (!await isModerator(actor)) throw AppError.forbidden('Acesso restrito a moderacao.');
++    return withTransaction(async () => {
++      await execute('DELETE FROM market_suspensions WHERE user_id=?', [target]);
++      if(process.env.ADMIN_ENABLED === 'true') await audit(actor,'market.restore','user',target,'Acesso ao marketplace restaurado');
++      return { restored: true };
++    });
+   },
+   async goal(actor: number, input: { month: string; amount: number }) {
+     await billingService.sync(actor);
+diff --git a/backend/src/routes/index.ts b/backend/src/routes/index.ts
+index 492aab7..f4123fa 100644
+--- a/backend/src/routes/index.ts
++++ b/backend/src/routes/index.ts
+@@ -1,3 +1,4 @@
++import { adminRoutes } from '../modules/admin/routes';
+ import { Router } from 'express';
+ 
+ import { APP_NAME, APP_TAGLINE } from '../config/constants';
+@@ -106,6 +107,7 @@ router.get('/', (_req, res) => {
+ router.get('/health', asyncHandler(healthController.check));
+ 
+ /* -------------------------------- Conta -------------------------------- */
++router.use('/admin', adminRoutes);
+ router.use('/auth', authRoutes);
+ router.use('/users', userRoutes);
+ router.use('/companies', companyRoutes);
+diff --git a/backend/src/scripts/admin-bootstrap.ts b/backend/src/scripts/admin-bootstrap.ts
+new file mode 100644
+index 0000000..ea50c4f
+--- /dev/null
++++ b/backend/src/scripts/admin-bootstrap.ts
+@@ -0,0 +1,17 @@
++import { queryOne, execute, withTransaction, closePool, type RowDataPacket } from '../config/database';
++import { audit } from '../modules/admin/security';
++async function main(){
++ const [email,idText,...extra]=process.argv.slice(2);const id=Number(idText);
++ if(!email || !Number.isSafeInteger(id) || id<1 || extra.length)throw new Error('Uso: node dist/scripts/admin-bootstrap.js EMAIL ID. Use uma conta existente.');
++ await withTransaction(async()=>{
++  await queryOne('SELECT id FROM admin_control WHERE id=1 FOR UPDATE');
++  const existing=await queryOne<RowDataPacket>("SELECT COUNT(*) n FROM admin_members m JOIN users u ON u.id=m.user_id WHERE m.enabled=1 AND m.role='owner' AND u.status='ativo' AND u.deleted_at IS NULL");
++  if(Number(existing?.n)>0)throw new Error('Já existe um proprietário. Gerencie os acessos pelo painel.');
++  const user=await queryOne<RowDataPacket>("SELECT id FROM users WHERE id=? AND email=? AND status='ativo' AND deleted_at IS NULL FOR UPDATE",[id,email]);
++  if(!user)throw new Error('ID e e-mail não correspondem a uma conta ativa.');
++  await execute("INSERT INTO admin_members(user_id,role,enabled) VALUES(?,'owner',1) ON DUPLICATE KEY UPDATE role='owner',enabled=1",[id]);
++  await audit(null,'admin.bootstrap','user',id,'Autorização inicial pelo operador do servidor');
++  console.log('Proprietário autorizado. Entre com a senha dessa conta no Clyvo Admin.');
++ });
++}
++main().catch(e=>{console.error(e.message);process.exitCode=1;}).finally(closePool);
+diff --git a/backend/src/scripts/admin-integration.test.ts b/backend/src/scripts/admin-integration.test.ts
+new file mode 100644
+index 0000000..ca4683f
+--- /dev/null
++++ b/backend/src/scripts/admin-integration.test.ts
+@@ -0,0 +1,57 @@
++/** Requires a migrated, isolated local database. Never points at production. */
++import assert from 'node:assert/strict';
++import { randomBytes } from 'node:crypto';
++async function main(){
++ if(process.env.NODE_ENV!=='test'||!process.env.DB_NAME?.endsWith('_admin_test')||!['localhost','127.0.0.1'].includes(process.env.DB_HOST??''))throw new Error('Use NODE_ENV=test, DB_HOST=127.0.0.1 e DB_NAME terminado em _admin_test.');
++ process.env.ADMIN_ENABLED='true';process.env.LOG_LEVEL='error';
++ const {execute,queryOne,closePool}=await import('../config/database');
++ const {hashPassword}=await import('../utils/password');
++ const {createApp}=await import('../app');
++ const ids:number[]=[];const password=randomBytes(24).toString('hex');const hash=await hashPassword(password);
++ const prefix='admin-test-'+Date.now();let checks=0;
++ const check=(condition:boolean)=>{assert.ok(condition);checks++;};
++ const server=createApp().listen(0,'127.0.0.1');await new Promise<void>(r=>server.once('listening',r));const base='http://127.0.0.1:'+(server.address() as {port:number}).port;process.env.ADMIN_ORIGIN=base;
++ const request=async(path:string,body?:unknown,cookie='',csrf='')=>{
++  const response=await fetch(base+'/api/admin'+path,{method:body===undefined?'GET':'POST',headers:{Origin:base,'Content-Type':'application/json',Cookie:cookie,'X-Clyvo-Csrf':csrf},body:body===undefined?undefined:JSON.stringify(body)});
++  const result=await response.json().catch(()=>null) as {data?: {csrf?: string}} | null;return {status:response.status,data:result?.data,cookie:response.headers.get('set-cookie')?.split(';')[0]??''};
++ };
++ try{
++  for(const role of ['owner','moderator','support','finance','user']){
++   const user=await execute('INSERT INTO users(name,email,password_hash) VALUES(?,?,?)',[`Teste ${role}`,`${prefix}-${role}@example.invalid`,hash]);ids.push(user.insertId);
++   if(role!=='user')await execute('INSERT INTO admin_members(user_id,role) VALUES(?,?)',[user.insertId,role]);
++  }
++  check((await request('/login',{email:`${prefix}-user@example.invalid`,password})).status===401);
++  const owner=await request('/login',{email:`${prefix}-owner@example.invalid`,password});check(owner.status===200);const identity=await request('/me',undefined,owner.cookie);const csrf=identity.data?.csrf ?? '';check(Boolean(csrf));
++  const mod=await request('/login',{email:`${prefix}-moderator@example.invalid`,password});const modCsrf=(await request('/me',undefined,mod.cookie)).data?.csrf ?? '';
++  check((await request('/users',undefined,mod.cookie)).status===403);
++  check((await request('/subscriptions',undefined,mod.cookie)).status===403);
++  check((await request('/admins',{email:`${prefix}-user@example.invalid`,role:'owner',enabled:true,reason:'Teste de acesso negado'},mod.cookie,modCsrf)).status===403);
++  const post=await execute("INSERT INTO market_posts(owner_id,title,category,description,mode,photos) VALUES(?,'Teste isolado','Outros','Publicação usada somente no teste','remoto','[]')",[ids[4]]);
++  await execute("INSERT INTO market_content_reviews(target_type,target_id,owner_id) VALUES('post',?,?)",[post.insertId,ids[4]]);
++  const path=`/content/post/${post.insertId}/decision`;
++  check((await request(path,{revision:1,action:'approved',note:'Conteúdo de teste aprovado'},owner.cookie)).status===403);
++  const concurrent=await Promise.all(['approved','rejected'].map(action=>request(path,{revision:1,action,note:'Decisão concorrente de teste'},owner.cookie,csrf)));
++  check(concurrent.filter(r=>r.status===200).length===1);check(concurrent.filter(r=>r.status===409).length===1);
++  const review=await queryOne<any>("SELECT * FROM market_content_reviews WHERE target_type='post' AND target_id=?",[post.insertId]);check(review.revision===2);
++  check((await request(path,{revision:2,action:'approved',note:'Aprovação para teste público'},owner.cookie,csrf)).status===200);
++  const {marketService}=await import('../modules/marketplace/service');
++  const published=await marketService.posts(ids[2],{page:1,sort:'recentes'});check(JSON.stringify(published).includes('Teste isolado'));
++  check((await request(path,{revision:3,action:'suspended',note:'Suspensão para teste público'},owner.cookie,csrf)).status===200);
++  const hidden=await marketService.posts(ids[2],{page:1,sort:'recentes'});check(!JSON.stringify(hidden).includes('Teste isolado'));
++  const reports=await execute("INSERT INTO market_reports(reporter_id,target_type,target_id,reason) VALUES(?,'post',?,'Teste de denúncia')",[ids[2],post.insertId]);
++  check((await request(`/reports/${reports.insertId}/resolve`,{action:'arquivar',note:'Encerramento de teste'},mod.cookie,modCsrf)).status===200);
++  check((await queryOne<any>('SELECT status FROM market_reports WHERE id=?',[reports.insertId]))?.status==='resolvida');
++  const audits=await queryOne<any>("SELECT COUNT(*) n FROM admin_audit WHERE target_type='post' AND target_id=?",[post.insertId]);check(Number(audits?.n)>=3);
++  check((await request('/admins',{email:`${prefix}-moderator@example.invalid`,role:'moderator',enabled:false,reason:'Revogação de teste'},owner.cookie,csrf)).status===200);
++  check((await request('/posts',undefined,mod.cookie)).status===401);
++  check((await request(`/users/${ids[4]}/status`,{status:'bloqueado',reason:'Suspensão de teste'},owner.cookie,csrf)).status===200);
++  check((await queryOne<any>('SELECT status FROM users WHERE id=?',[ids[4]]))?.status==='bloqueado');
++  await execute('UPDATE admin_sessions SET last_seen_at=DATE_SUB(UTC_TIMESTAMP(),INTERVAL 31 MINUTE) WHERE user_id=?',[ids[0]]);
++  check((await request('/dashboard',undefined,owner.cookie)).status===401);
++  console.log(`${checks} verificações de integração com banco real aprovadas.`);
++ }finally{
++  for(const id of ids){await execute('DELETE FROM admin_audit WHERE actor_id=? OR (target_type=\'user\' AND target_id=?)',[id,id]);await execute('DELETE FROM users WHERE id=?',[id]);}
++  await new Promise<void>((resolve,reject)=>server.close(e=>e?reject(e):resolve()));await closePool();
++ }
++}
++main().catch(e=>{console.error(e.message);process.exitCode=1;});
+diff --git a/backend/src/scripts/admin-migrate.ts b/backend/src/scripts/admin-migrate.ts
+new file mode 100644
+index 0000000..381a4ff
+--- /dev/null
++++ b/backend/src/scripts/admin-migrate.ts
+@@ -0,0 +1,12 @@
++import fs from 'node:fs';
++import path from 'node:path';
++import {getPool,closePool} from '../config/database';
++async function main(){
++ const candidates=[path.resolve('database/admin.sql'),path.resolve('../database/admin.sql')];
++ const file=candidates.find(p=>fs.existsSync(p));if(!file)throw new Error('database/admin.sql não encontrado.');
++ // Run only additive admin DDL; never rerun plan seeds or drop data.
++ const sql=fs.readFileSync(file,'utf8').replace(/^--.*$/gm,'');
++ for(const statement of sql.split(';').map(s=>s.trim()).filter(Boolean))await getPool().query(statement);
++ console.log('Estrutura administrativa criada. Nenhum plano ou dado existente foi alterado.');
++}
++main().catch(e=>{console.error(e.message);process.exitCode=1;}).finally(closePool);
+diff --git a/backend/src/scripts/admin.test.ts b/backend/src/scripts/admin.test.ts
+new file mode 100644
+index 0000000..17f1a25
+--- /dev/null
++++ b/backend/src/scripts/admin.test.ts
+@@ -0,0 +1,37 @@
++import assert from 'node:assert/strict';
++import { randomBytes } from 'node:crypto';
++import type { Request } from 'express';
++import { allowed, permissions } from '../modules/admin/permissions';
++process.env.NODE_ENV='test';
++process.env.JWT_ACCESS_SECRET=randomBytes(48).toString('hex');
++process.env.JWT_REFRESH_SECRET=randomBytes(48).toString('hex');
++process.env.ADMIN_ORIGIN='http://localhost:3333';
++process.env.ADMIN_ENABLED='true';
++process.env.LOG_LEVEL='error';
++async function main(){
++ const s=await import('../modules/admin/security');
++ let count=0;const check=(v:boolean)=>{assert.ok(v);count++;};
++ for(const p of permissions)check(allowed('owner',p));
++ for(const role of ['free','pro','pro_max','user','', '__proto__'])for(const p of permissions)check(!allowed(role,p));
++ check(allowed('moderator','content.write'));check(!allowed('moderator','settings'));check(!allowed('moderator','billing'));
++ check(allowed('support','users.read'));check(!allowed('support','users.write'));check(!allowed('finance','users.read'));check(allowed('finance','billing'));check(!allowed('auditor','content.write'));
++ const token=randomBytes(32).toString('hex');
++ const req=(origin:string|undefined,csrf:string,cookie='clyvo_admin='+token)=>({headers:{cookie},get:(key:string)=>key==='origin'?origin:key==='x-clyvo-csrf'?csrf:undefined} as unknown as Request);
++ const csrf=s.hash('admin-csrf:'+token);
++ s.checkCsrf(req(process.env.ADMIN_ORIGIN,csrf));count++;
++ for(const r of [req('https://evil.example',csrf),req(undefined,csrf),req(process.env.ADMIN_ORIGIN,''),req(process.env.ADMIN_ORIGIN,'a'.repeat(64)),req(process.env.ADMIN_ORIGIN,'é'.repeat(64)),req(process.env.ADMIN_ORIGIN,csrf,'')]){assert.throws(()=>s.checkCsrf(r));count++;}
++ assert.equal(s.tokenFrom(req(process.env.ADMIN_ORIGIN,csrf,'clyvo_admin=invalid')),'');count++;
++ assert.equal(s.cookieOptions().httpOnly,true);count++;assert.equal(s.cookieOptions().sameSite,'strict');count++;
++ await assert.rejects(()=>s.session({headers:{authorization:'Bearer regular-app-token'}} as Request));count++;
++ const {createApp}=await import('../app');const server=createApp().listen(0,'127.0.0.1');await new Promise<void>(r=>server.once('listening',r));
++ const address=server.address() as {port:number};const base='http://127.0.0.1:'+address.port;
++ try{
++  for(const path of ['/api/admin/dashboard','/api/admin/users','/api/admin/posts','/api/admin/subscriptions','/api/admin/admins','/api/admin/audit']){
++   const res=await fetch(base+path,{headers:{Authorization:'Bearer regular-app-token'}});assert.equal(res.status,401);count++;
++  }
++  const denied=await fetch(base+'/api/admin/login',{method:'POST',headers:{'Content-Type':'application/json',Origin:'https://evil.example'},body:JSON.stringify({email:'test@example.invalid',password:'not-a-real-password'})});assert.equal(denied.status,403);count++;
++  process.env.ADMIN_ENABLED='false';const disabled=await fetch(base+'/api/admin/dashboard');assert.equal(disabled.status,404);count++;
++ }finally{await new Promise<void>((r,j)=>server.close(e=>e?j(e):r()));}
++ console.log(`${count} verificações de permissões, CSRF, cookie e isolamento HTTP aprovadas. Não substituem testes com MySQL.`);
++}
++main().catch(e=>{console.error(e);process.exitCode=1;});
+diff --git a/backend/src/scripts/migrate.ts b/backend/src/scripts/migrate.ts
+index 14b6939..ffb874b 100644
+--- a/backend/src/scripts/migrate.ts
++++ b/backend/src/scripts/migrate.ts
+@@ -51,6 +51,9 @@ async function main(): Promise<void> {
+       const moderationPath = path.join(path.dirname(schemaPath), 'marketplace-moderation.sql');
+       if (fs.existsSync(moderationPath)) await connection.query(fs.readFileSync(moderationPath, 'utf8'));
+ 
++      const adminPath = path.join(path.dirname(schemaPath), 'admin.sql');
++      if (fs.existsSync(adminPath)) await connection.query(fs.readFileSync(adminPath, 'utf8'));
++
+       await connection.query(`USE \`${env.DB_NAME}\``);
+       const [tables] = await connection.query<any[]>('SHOW TABLES');
+ 
+diff --git a/database/admin.sql b/database/admin.sql
+new file mode 100644
+index 0000000..5816a11
+--- /dev/null
++++ b/database/admin.sql
+@@ -0,0 +1,25 @@
++-- Additive only. Existing users, billing and marketplace data are reused.
++CREATE TABLE IF NOT EXISTS admin_control (id TINYINT PRIMARY KEY) ENGINE=InnoDB;
++INSERT IGNORE INTO admin_control(id) VALUES(1);
++CREATE TABLE IF NOT EXISTS admin_members (
++ user_id BIGINT UNSIGNED PRIMARY KEY,
++ role VARCHAR(20) NOT NULL,
++ enabled TINYINT NOT NULL DEFAULT 1,
++ created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
++ FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
++) ENGINE=InnoDB;
++CREATE TABLE IF NOT EXISTS admin_sessions (
++ token_hash CHAR(64) PRIMARY KEY, user_id BIGINT UNSIGNED NOT NULL,
++ security_version INT NOT NULL, expires_at DATETIME NOT NULL,
++ last_seen_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
++ FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
++ KEY idx_admin_sessions_user(user_id)
++) ENGINE=InnoDB;
++CREATE TABLE IF NOT EXISTS admin_audit (
++ id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
++ actor_id BIGINT UNSIGNED NULL, action VARCHAR(80) NOT NULL,
++ target_type VARCHAR(30) NOT NULL, target_id BIGINT UNSIGNED NULL,
++ reason VARCHAR(500) NOT NULL DEFAULT '', metadata JSON NULL,
++ created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
++ KEY idx_admin_audit_date(created_at)
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+diff --git a/frontend/src/features/marketplace/PostCard.tsx b/frontend/src/features/marketplace/PostCard.tsx
+index 5e7bc69..8ccd38b 100644
+--- a/frontend/src/features/marketplace/PostCard.tsx
++++ b/frontend/src/features/marketplace/PostCard.tsx
+@@ -1,7 +1,7 @@
+ import { useRouter } from 'expo-router';
+ import { Feather } from '@expo/vector-icons';
+ import { Button,Card,Text,View,Image,Note,styles,theme,currency,categoryLabel } from './ui';
+-export const moderationLabel=(state:string)=>({approved:'Publicado',pending:'Em análise',rejected:'Não aprovado'}[state]??'Em análise');
++export const moderationLabel=(state:string)=>({approved:'Publicado',pending:'Em análise',rejected:'Não aprovado',changes:'Correções solicitadas',suspended:'Publicação suspensa'}[state]??'Em análise');
+ export function PostCard({post:p,own=false}:{post:any;own?:boolean}) {
+  const router=useRouter();
+  const price=p.budget_from!=null&&p.budget_to!=null?currency(p.budget_from)+' a '+currency(p.budget_to):p.budget_to!=null?'Até '+currency(p.budget_to):p.budget_from!=null?'A partir de '+currency(p.budget_from):'Valor a combinar';
